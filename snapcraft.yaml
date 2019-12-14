@@ -1,5 +1,5 @@
 name: gost
-version: '2.6'
+version: '2.8'
 summary: GO Simple Tunnel
 description: |
   A simple tunnel written in golang

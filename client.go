@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/url"
 	"time"
+
+	"github.com/ginuerzh/gosocks5"
 )
 
 // Client is a proxy client.
@@ -62,10 +64,10 @@ type Transporter interface {
 	Multiplex() bool
 }
 
-type tcpTransporter struct {
-}
+// tcpTransporter is a raw TCP transporter.
+type tcpTransporter struct{}
 
-// TCPTransporter creates a transporter for TCP proxy client.
+// TCPTransporter creates a raw TCP client.
 func TCPTransporter() Transporter {
 	return &tcpTransporter{}
 }
@@ -76,8 +78,12 @@ func (tr *tcpTransporter) Dial(addr string, options ...DialOption) (net.Conn, er
 		option(opts)
 	}
 
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DialTimeout
+	}
 	if opts.Chain == nil {
-		return net.DialTimeout("tcp", addr, opts.Timeout)
+		return net.DialTimeout("tcp", addr, timeout)
 	}
 	return opts.Chain.Dial(addr)
 }
@@ -87,6 +93,36 @@ func (tr *tcpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (
 }
 
 func (tr *tcpTransporter) Multiplex() bool {
+	return false
+}
+
+// udpTransporter is a raw UDP transporter.
+type udpTransporter struct{}
+
+// UDPTransporter creates a raw UDP client.
+func UDPTransporter() Transporter {
+	return &udpTransporter{}
+}
+
+func (tr *udpTransporter) Dial(addr string, options ...DialOption) (net.Conn, error) {
+	opts := &DialOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DialTimeout
+	}
+
+	return net.DialTimeout("udp", addr, timeout)
+}
+
+func (tr *udpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (net.Conn, error) {
+	return conn, nil
+}
+
+func (tr *udpTransporter) Multiplex() bool {
 	return false
 }
 
@@ -202,7 +238,11 @@ func QUICConfigHandshakeOption(config *QUICConfig) HandshakeOption {
 
 // ConnectOptions describes the options for Connector.Connect.
 type ConnectOptions struct {
-	Addr string
+	Addr      string
+	Timeout   time.Duration
+	User      *url.Userinfo
+	Selector  gosocks5.Selector
+	UserAgent string
 }
 
 // ConnectOption allows a common way to set ConnectOptions.
@@ -212,5 +252,33 @@ type ConnectOption func(opts *ConnectOptions)
 func AddrConnectOption(addr string) ConnectOption {
 	return func(opts *ConnectOptions) {
 		opts.Addr = addr
+	}
+}
+
+// TimeoutConnectOption specifies the timeout for connecting to target.
+func TimeoutConnectOption(timeout time.Duration) ConnectOption {
+	return func(opts *ConnectOptions) {
+		opts.Timeout = timeout
+	}
+}
+
+// UserConnectOption specifies the user info for authentication.
+func UserConnectOption(user *url.Userinfo) ConnectOption {
+	return func(opts *ConnectOptions) {
+		opts.User = user
+	}
+}
+
+// SelectorConnectOption specifies the SOCKS5 client selector.
+func SelectorConnectOption(s gosocks5.Selector) ConnectOption {
+	return func(opts *ConnectOptions) {
+		opts.Selector = s
+	}
+}
+
+// UserAgentConnectOption specifies the HTTP user-agent header.
+func UserAgentConnectOption(ua string) ConnectOption {
+	return func(opts *ConnectOptions) {
+		opts.UserAgent = ua
 	}
 }

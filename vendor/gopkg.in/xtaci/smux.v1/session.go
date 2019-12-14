@@ -17,6 +17,7 @@ const (
 const (
 	errBrokenPipe      = "broken pipe"
 	errInvalidProtocol = "invalid protocol version"
+	errGoAway          = "stream id overflows, should start a new connection"
 )
 
 type writeRequest struct {
@@ -31,14 +32,14 @@ type writeResult struct {
 
 // Session defines a multiplexed connection for streams
 type Session struct {
-	conn      io.ReadWriteCloser
-	writeLock sync.Mutex
+	conn io.ReadWriteCloser
 
-	config       *Config
-	nextStreamID uint32 // next stream identifier
+	config           *Config
+	nextStreamID     uint32 // next stream identifier
+	nextStreamIDLock sync.Mutex
 
-	bucket     int32      // token bucket
-	bucketCond *sync.Cond // used for waiting for tokens
+	bucket       int32         // token bucket
+	bucketNotify chan struct{} // used for waiting for tokens
 
 	streams    map[uint32]*Stream // all streams in this session
 	streamLock sync.Mutex         // locks streams
@@ -47,8 +48,9 @@ type Session struct {
 	dieLock   sync.Mutex
 	chAccepts chan *Stream
 
-	xmitPool  sync.Pool
 	dataReady int32 // flag data has arrived
+
+	goAway int32 // flag id exhausted
 
 	deadline atomic.Value
 
@@ -63,16 +65,13 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.streams = make(map[uint32]*Stream)
 	s.chAccepts = make(chan *Stream, defaultAcceptBacklog)
 	s.bucket = int32(config.MaxReceiveBuffer)
-	s.bucketCond = sync.NewCond(&sync.Mutex{})
-	s.xmitPool.New = func() interface{} {
-		return make([]byte, (1<<16)+headerSize)
-	}
+	s.bucketNotify = make(chan struct{}, 1)
 	s.writes = make(chan writeRequest)
 
 	if client {
 		s.nextStreamID = 1
 	} else {
-		s.nextStreamID = 2
+		s.nextStreamID = 0
 	}
 	go s.recvLoop()
 	go s.sendLoop()
@@ -86,7 +85,22 @@ func (s *Session) OpenStream() (*Stream, error) {
 		return nil, errors.New(errBrokenPipe)
 	}
 
-	sid := atomic.AddUint32(&s.nextStreamID, 2)
+	// generate stream id
+	s.nextStreamIDLock.Lock()
+	if s.goAway > 0 {
+		s.nextStreamIDLock.Unlock()
+		return nil, errors.New(errGoAway)
+	}
+
+	s.nextStreamID += 2
+	sid := s.nextStreamID
+	if sid == sid%2 { // stream-id overflows
+		s.goAway = 1
+		s.nextStreamIDLock.Unlock()
+		return nil, errors.New(errGoAway)
+	}
+	s.nextStreamIDLock.Unlock()
+
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
 	if _, err := s.writeFrame(newFrame(cmdSYN, sid)); err != nil {
@@ -104,7 +118,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 func (s *Session) AcceptStream() (*Stream, error) {
 	var deadline <-chan time.Time
 	if d, ok := s.deadline.Load().(time.Time); ok && !d.IsZero() {
-		timer := time.NewTimer(d.Sub(time.Now()))
+		timer := time.NewTimer(time.Until(d))
 		defer timer.Stop()
 		deadline = timer.C
 	}
@@ -134,8 +148,16 @@ func (s *Session) Close() (err error) {
 			s.streams[k].sessionClose()
 		}
 		s.streamLock.Unlock()
-		s.bucketCond.Signal()
+		s.notifyBucket()
 		return s.conn.Close()
+	}
+}
+
+// notifyBucket notifies recvLoop that bucket is available
+func (s *Session) notifyBucket() {
+	select {
+	case s.bucketNotify <- struct{}{}:
+	default:
 	}
 }
 
@@ -171,7 +193,7 @@ func (s *Session) streamClosed(sid uint32) {
 	s.streamLock.Lock()
 	if n := s.streams[sid].recycleTokens(); n > 0 { // return remaining tokens to the bucket
 		if atomic.AddInt32(&s.bucket, int32(n)) > 0 {
-			s.bucketCond.Signal()
+			s.notifyBucket()
 		}
 	}
 	delete(s.streams, sid)
@@ -180,12 +202,9 @@ func (s *Session) streamClosed(sid uint32) {
 
 // returnTokens is called by stream to return token after read
 func (s *Session) returnTokens(n int) {
-	oldvalue := atomic.LoadInt32(&s.bucket)
-	newvalue := atomic.AddInt32(&s.bucket, int32(n))
-	if oldvalue <= 0 && newvalue > 0 {
-		s.bucketCond.Signal()
+	if atomic.AddInt32(&s.bucket, int32(n)) > 0 {
+		s.notifyBucket()
 	}
-
 }
 
 // session read a frame from underlying connection
@@ -216,14 +235,8 @@ func (s *Session) readFrame(buffer []byte) (f Frame, err error) {
 func (s *Session) recvLoop() {
 	buffer := make([]byte, (1<<16)+headerSize)
 	for {
-		s.bucketCond.L.Lock()
 		for atomic.LoadInt32(&s.bucket) <= 0 && !s.IsClosed() {
-			s.bucketCond.Wait()
-		}
-		s.bucketCond.L.Unlock()
-
-		if s.IsClosed() {
-			return
+			<-s.bucketNotify
 		}
 
 		if f, err := s.readFrame(buffer); err == nil {
@@ -242,7 +255,7 @@ func (s *Session) recvLoop() {
 					}
 				}
 				s.streamLock.Unlock()
-			case cmdRST:
+			case cmdFIN:
 				s.streamLock.Lock()
 				if stream, ok := s.streams[f.sid]; ok {
 					stream.markRST()
@@ -277,7 +290,7 @@ func (s *Session) keepalive() {
 		select {
 		case <-tickerPing.C:
 			s.writeFrame(newFrame(cmdNOP, 0))
-			s.bucketCond.Signal() // force a signal to the recvLoop
+			s.notifyBucket() // force a signal to the recvLoop
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.dataReady, 1, 0) {
 				s.Close()
@@ -290,25 +303,18 @@ func (s *Session) keepalive() {
 }
 
 func (s *Session) sendLoop() {
+	buf := make([]byte, (1<<16)+headerSize)
 	for {
 		select {
 		case <-s.die:
 			return
-		case request, ok := <-s.writes:
-			if !ok {
-				continue
-			}
-			buf := s.xmitPool.Get().([]byte)
+		case request := <-s.writes:
 			buf[0] = request.frame.ver
 			buf[1] = request.frame.cmd
 			binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
 			binary.LittleEndian.PutUint32(buf[4:], request.frame.sid)
 			copy(buf[headerSize:], request.frame.data)
-
-			s.writeLock.Lock()
 			n, err := s.conn.Write(buf[:headerSize+len(request.frame.data)])
-			s.writeLock.Unlock()
-			s.xmitPool.Put(buf)
 
 			n -= headerSize
 			if n < 0 {

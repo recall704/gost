@@ -20,19 +20,26 @@ type Handler interface {
 
 // HandlerOptions describes the options for Handler.
 type HandlerOptions struct {
-	Addr        string
-	Chain       *Chain
-	Users       []*url.Userinfo
-	TLSConfig   *tls.Config
-	Whitelist   *Permissions
-	Blacklist   *Permissions
-	Strategy    Strategy
-	Bypass      *Bypass
-	Retries     int
-	Timeout     time.Duration
-	Resolver    Resolver
-	Hosts       *Hosts
-	ProbeResist string
+	Addr          string
+	Chain         *Chain
+	Users         []*url.Userinfo
+	Authenticator Authenticator
+	TLSConfig     *tls.Config
+	Whitelist     *Permissions
+	Blacklist     *Permissions
+	Strategy      Strategy
+	MaxFails      int
+	FailTimeout   time.Duration
+	Bypass        *Bypass
+	Retries       int
+	Timeout       time.Duration
+	Resolver      Resolver
+	Hosts         *Hosts
+	ProbeResist   string
+	KnockingHost  string
+	Node          Node
+	Host          string
+	IPs           []string
 }
 
 // HandlerOption allows a common way to set handler options.
@@ -56,6 +63,23 @@ func ChainHandlerOption(chain *Chain) HandlerOption {
 func UsersHandlerOption(users ...*url.Userinfo) HandlerOption {
 	return func(opts *HandlerOptions) {
 		opts.Users = users
+
+		kvs := make(map[string]string)
+		for _, u := range users {
+			if u != nil {
+				kvs[u.Username()], _ = u.Password()
+			}
+		}
+		if len(kvs) > 0 {
+			opts.Authenticator = NewLocalAuthenticator(kvs)
+		}
+	}
+}
+
+// AuthenticatorHandlerOption sets the Authenticator option of HandlerOptions.
+func AuthenticatorHandlerOption(au Authenticator) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.Authenticator = au
 	}
 }
 
@@ -94,6 +118,20 @@ func StrategyHandlerOption(strategy Strategy) HandlerOption {
 	}
 }
 
+// MaxFailsHandlerOption sets the max_fails option of HandlerOptions.
+func MaxFailsHandlerOption(n int) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.MaxFails = n
+	}
+}
+
+// FailTimeoutHandlerOption sets the fail_timeout option of HandlerOptions.
+func FailTimeoutHandlerOption(d time.Duration) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.FailTimeout = d
+	}
+}
+
 // RetryHandlerOption sets the retry option of HandlerOptions.
 func RetryHandlerOption(retries int) HandlerOption {
 	return func(opts *HandlerOptions) {
@@ -126,6 +164,34 @@ func HostsHandlerOption(hosts *Hosts) HandlerOption {
 func ProbeResistHandlerOption(pr string) HandlerOption {
 	return func(opts *HandlerOptions) {
 		opts.ProbeResist = pr
+	}
+}
+
+// KnockingHandlerOption adds the knocking host for probe resistance.
+func KnockingHandlerOption(host string) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.KnockingHost = host
+	}
+}
+
+// NodeHandlerOption set the server node for server handler.
+func NodeHandlerOption(node Node) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.Node = node
+	}
+}
+
+// HostHandlerOption sets the target host for SNI proxy.
+func HostHandlerOption(host string) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.Host = host
+	}
+}
+
+// IPsHandlerOption sets the ip list for port forward.
+func IPsHandlerOption(ips []string) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.IPs = ips
 	}
 }
 

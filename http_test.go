@@ -1,127 +1,378 @@
 package gost
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/rand"
-	"io"
+	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 )
 
-var httpTestHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	io.Copy(w, r.Body)
-})
-
-func httpProxyRoundtrip(urlStr string, cliUser *url.Userinfo, srvUsers []*url.Userinfo, body io.Reader) (statusCode int, recv []byte, err error) {
-	ln, err := TCPListener("")
-	if err != nil {
-		return
-	}
-	h := HTTPHandler(UsersHandlerOption(srvUsers...))
-	server := &Server{Listener: ln}
-	go server.Serve(h)
-
-	exitChan := make(chan struct{})
-	defer close(exitChan)
-	go func() {
-		defer server.Close()
-		<-exitChan
-	}()
-
-	client := &Client{
-		Connector:   HTTPConnector(cliUser),
-		Transporter: TCPTransporter(),
-	}
-	conn, err := client.Dial(ln.Addr().String())
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	conn, err = client.Handshake(conn)
-	if err != nil {
-		return
-	}
-	url, err := url.Parse(urlStr)
-	if err != nil {
-		return
-	}
-	conn, err = client.Connect(conn, url.Host)
-	if err != nil {
-		return
-	}
-	req, err := http.NewRequest(http.MethodGet, urlStr, body)
-	if err != nil {
-		return
-	}
-	if err = req.Write(conn); err != nil {
-		return
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	statusCode = resp.StatusCode
-	recv, err = ioutil.ReadAll(resp.Body)
-	return
-}
-
 var httpProxyTests = []struct {
-	url      string
 	cliUser  *url.Userinfo
 	srvUsers []*url.Userinfo
 	errStr   string
 }{
-	{"", nil, nil, ""},
-	{"", nil, []*url.Userinfo{url.User("admin")}, "407 Proxy Authentication Required"},
-	{"", nil, []*url.Userinfo{url.UserPassword("", "123456")}, "407 Proxy Authentication Required"},
-	{"", url.User("admin"), []*url.Userinfo{url.User("test")}, "407 Proxy Authentication Required"},
-	{"", url.User("admin"), []*url.Userinfo{url.UserPassword("admin", "123456")}, "407 Proxy Authentication Required"},
-	{"", url.User("admin"), []*url.Userinfo{url.User("admin")}, ""},
-	{"", url.User("admin"), []*url.Userinfo{url.UserPassword("admin", "")}, ""},
-	{"", url.UserPassword("admin", "123456"), nil, ""},
-	{"", url.UserPassword("admin", "123456"), []*url.Userinfo{url.User("admin")}, ""},
-	{"", url.UserPassword("admin", "123456"), []*url.Userinfo{url.UserPassword("", "123456")}, ""},
-	{"", url.UserPassword("", "123456"), []*url.Userinfo{url.UserPassword("", "123456")}, ""},
-	{"", url.UserPassword("admin", "123456"), []*url.Userinfo{url.UserPassword("admin", "123456")}, ""},
-	{"", url.UserPassword("admin", "123456"), []*url.Userinfo{url.UserPassword("user", "pass"), url.UserPassword("admin", "123456")}, ""},
-	{"http://:0", nil, nil, "503 Service Unavailable"},
+	{nil, nil, ""},
+	{nil, []*url.Userinfo{url.User("admin")}, "407 Proxy Authentication Required"},
+	{nil, []*url.Userinfo{url.UserPassword("", "123456")}, "407 Proxy Authentication Required"},
+	{url.User("admin"), []*url.Userinfo{url.User("test")}, "407 Proxy Authentication Required"},
+	{url.User("admin"), []*url.Userinfo{url.UserPassword("admin", "123456")}, "407 Proxy Authentication Required"},
+	{url.User("admin"), []*url.Userinfo{url.User("admin")}, ""},
+	{url.User("admin"), []*url.Userinfo{url.UserPassword("admin", "")}, ""},
+	{url.UserPassword("admin", "123456"), nil, ""},
+	{url.UserPassword("admin", "123456"), []*url.Userinfo{url.User("admin")}, ""},
+	{url.UserPassword("admin", "123456"), []*url.Userinfo{url.UserPassword("", "123456")}, "407 Proxy Authentication Required"},
+	{url.UserPassword("", "123456"), []*url.Userinfo{url.UserPassword("", "123456")}, ""},
+	{url.UserPassword("admin", "123456"), []*url.Userinfo{url.UserPassword("admin", "123456")}, ""},
+	{url.UserPassword("admin", "123456"), []*url.Userinfo{url.UserPassword("user", "pass"), url.UserPassword("admin", "123456")}, ""},
 }
 
-func TestHTTPProxy(t *testing.T) {
-	Debug = true
+func httpProxyRoundtrip(targetURL string, data []byte, clientInfo *url.Userinfo, serverInfo []*url.Userinfo) error {
+	ln, err := TCPListener("")
+	if err != nil {
+		return err
+	}
+
+	client := &Client{
+		Connector:   HTTPConnector(clientInfo),
+		Transporter: TCPTransporter(),
+	}
+
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			UsersHandlerOption(serverInfo...),
+		),
+	}
+
+	go server.Run()
+	defer server.Close()
+
+	return proxyRoundtrip(client, server, targetURL, data)
+}
+
+func TestHTTPProxyAuth(t *testing.T) {
 	httpSrv := httptest.NewServer(httpTestHandler)
 	defer httpSrv.Close()
 
-	for _, test := range httpProxyTests {
-		send := make([]byte, 16)
-		rand.Read(send)
-		urlStr := test.url
-		if urlStr == "" {
-			urlStr = httpSrv.URL
-		}
-		_, recv, err := httpProxyRoundtrip(urlStr, test.cliUser, test.srvUsers, bytes.NewReader(send))
-		if err == nil {
-			if test.errStr != "" {
-				t.Errorf("HTTP proxy response should failed with error %s", test.errStr)
-				continue
+	sendData := make([]byte, 128)
+	rand.Read(sendData)
+
+	for i, tc := range httpProxyTests {
+		tc := tc
+		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
+			err := httpProxyRoundtrip(httpSrv.URL, sendData, tc.cliUser, tc.srvUsers)
+			if err == nil {
+				if tc.errStr != "" {
+					t.Errorf("#%d should failed with error %s", i, tc.errStr)
+				}
+			} else {
+				if tc.errStr == "" {
+					t.Errorf("#%d got error %v", i, err)
+				}
+				if err.Error() != tc.errStr {
+					t.Errorf("#%d got error %v, want %v", i, err, tc.errStr)
+				}
 			}
-		} else {
-			if test.errStr == "" {
-				t.Errorf("HTTP proxy got error %v", err)
-			}
-			if err.Error() != test.errStr {
-				t.Errorf("HTTP proxy got error %v, want %v", err, test.errStr)
-			}
-			continue
+		})
+	}
+}
+
+func TestHTTPProxyWithInvalidRequest(t *testing.T) {
+	httpSrv := httptest.NewServer(httpTestHandler)
+	defer httpSrv.Close()
+
+	sendData := make([]byte, 128)
+	rand.Read(sendData)
+
+	ln, err := TCPListener("")
+	if err != nil {
+		t.Error(err)
+	}
+
+	server := &Server{
+		Listener: ln,
+		Handler:  HTTPHandler(),
+	}
+	go server.Run()
+	defer server.Close()
+
+	r, err := http.NewRequest("GET", "http://"+ln.Addr().String(), bytes.NewReader(sendData))
+	if err != nil {
+		t.Error(err)
+	}
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Error(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Error("got status:", resp.Status)
+	}
+}
+
+func BenchmarkHTTPProxy(b *testing.B) {
+	httpSrv := httptest.NewServer(httpTestHandler)
+	defer httpSrv.Close()
+
+	sendData := make([]byte, 128)
+	rand.Read(sendData)
+
+	ln, err := TCPListener("")
+	if err != nil {
+		b.Error(err)
+	}
+
+	client := &Client{
+		Connector:   HTTPConnector(url.UserPassword("admin", "123456")),
+		Transporter: TCPTransporter(),
+	}
+
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			UsersHandlerOption(url.UserPassword("admin", "123456")),
+		),
+	}
+	go server.Run()
+	defer server.Close()
+
+	for i := 0; i < b.N; i++ {
+		if err := proxyRoundtrip(client, server, httpSrv.URL, sendData); err != nil {
+			b.Error(err)
 		}
-		if !bytes.Equal(send, recv) {
-			t.Errorf("got %v, want %v", recv, send)
-			continue
+	}
+}
+
+func BenchmarkHTTPProxyParallel(b *testing.B) {
+	httpSrv := httptest.NewServer(httpTestHandler)
+	defer httpSrv.Close()
+
+	sendData := make([]byte, 128)
+	rand.Read(sendData)
+
+	ln, err := TCPListener("")
+	if err != nil {
+		b.Error(err)
+	}
+
+	client := &Client{
+		Connector:   HTTPConnector(url.UserPassword("admin", "123456")),
+		Transporter: TCPTransporter(),
+	}
+
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			UsersHandlerOption(url.UserPassword("admin", "123456")),
+		),
+	}
+	go server.Run()
+	defer server.Close()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := proxyRoundtrip(client, server, httpSrv.URL, sendData); err != nil {
+				b.Error(err)
+			}
 		}
+	})
+}
+
+func TestHTTPProxyWithCodeProbeResist(t *testing.T) {
+	ln, err := TCPListener("")
+	if err != nil {
+		t.Error(err)
+	}
+
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			UsersHandlerOption(url.UserPassword("admin", "123456")),
+			ProbeResistHandlerOption("code:400"),
+		),
+	}
+	go server.Run()
+	defer server.Close()
+
+	resp, err := http.Get("http://" + ln.Addr().String())
+	if err != nil {
+		t.Error(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 400 {
+		t.Error("should failed with status code 400, got", resp.Status)
+	}
+}
+
+func TestHTTPProxyWithWebProbeResist(t *testing.T) {
+	httpSrv := httptest.NewServer(httpTestHandler)
+	defer httpSrv.Close()
+
+	ln, err := TCPListener("")
+	if err != nil {
+		t.Error(err)
+	}
+
+	u, err := url.Parse(httpSrv.URL)
+	if err != nil {
+		t.Error(err)
+	}
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			UsersHandlerOption(url.UserPassword("admin", "123456")),
+			ProbeResistHandlerOption("web:"+u.Host),
+		),
+	}
+	go server.Run()
+	defer server.Close()
+
+	r, err := http.NewRequest("GET", "http://"+ln.Addr().String(), nil)
+	if err != nil {
+		t.Error(err)
+	}
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Error(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Error("got status:", resp.Status)
+	}
+
+	recv, _ := ioutil.ReadAll(resp.Body)
+	if !bytes.Equal(recv, []byte("Hello World!")) {
+		t.Error("data not equal")
+	}
+}
+
+func TestHTTPProxyWithHostProbeResist(t *testing.T) {
+	httpSrv := httptest.NewServer(httpTestHandler)
+	defer httpSrv.Close()
+
+	sendData := make([]byte, 128)
+	rand.Read(sendData)
+
+	ln, err := TCPListener("")
+	if err != nil {
+		t.Error(err)
+	}
+
+	u, err := url.Parse(httpSrv.URL)
+	if err != nil {
+		t.Error(err)
+	}
+
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			UsersHandlerOption(url.UserPassword("admin", "123456")),
+			ProbeResistHandlerOption("host:"+u.Host),
+		),
+	}
+	go server.Run()
+	defer server.Close()
+
+	r, err := http.NewRequest("GET", "http://"+ln.Addr().String(), bytes.NewReader(sendData))
+	if err != nil {
+		t.Error(err)
+	}
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Error(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Error("got status:", resp.Status)
+	}
+
+	recv, _ := ioutil.ReadAll(resp.Body)
+	if !bytes.Equal(sendData, recv) {
+		t.Error("data not equal")
+	}
+}
+
+func TestHTTPProxyWithFileProbeResist(t *testing.T) {
+	ln, err := TCPListener("")
+	if err != nil {
+		t.Error(err)
+	}
+
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			UsersHandlerOption(url.UserPassword("admin", "123456")),
+			ProbeResistHandlerOption("file:.config/probe_resist.txt"),
+		),
+	}
+	go server.Run()
+	defer server.Close()
+
+	r, err := http.NewRequest("GET", "http://"+ln.Addr().String(), nil)
+	if err != nil {
+		t.Error(err)
+	}
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Error(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Error("got status:", resp.Status)
+	}
+
+	recv, _ := ioutil.ReadAll(resp.Body)
+	if !bytes.Equal(recv, []byte("Hello World!")) {
+		t.Error("data not equal, got:", string(recv))
+	}
+}
+
+func TestHTTPProxyWithBypass(t *testing.T) {
+	httpSrv := httptest.NewServer(httpTestHandler)
+	defer httpSrv.Close()
+
+	sendData := make([]byte, 128)
+	rand.Read(sendData)
+
+	u, err := url.Parse(httpSrv.URL)
+	if err != nil {
+		t.Error(err)
+	}
+	ln, err := TCPListener("")
+	if err != nil {
+		t.Error(err)
+	}
+
+	client := &Client{
+		Connector:   HTTPConnector(nil),
+		Transporter: TCPTransporter(),
+	}
+
+	host := u.Host
+	if h, _, _ := net.SplitHostPort(u.Host); h != "" {
+		host = h
+	}
+	server := &Server{
+		Listener: ln,
+		Handler: HTTPHandler(
+			BypassHandlerOption(NewBypassPatterns(false, host)),
+		),
+	}
+	go server.Run()
+	defer server.Close()
+
+	if err = proxyRoundtrip(client, server, httpSrv.URL, sendData); err == nil {
+		t.Error("should failed")
 	}
 }

@@ -30,7 +30,13 @@ func (tr *tlsTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (
 	if opts.TLSConfig == nil {
 		opts.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 	}
-	return wrapTLSClient(conn, opts.TLSConfig, opts.Timeout)
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = HandshakeTimeout
+	}
+
+	return wrapTLSClient(conn, opts.TLSConfig, timeout)
 }
 
 type mtlsTransporter struct {
@@ -56,14 +62,18 @@ func (tr *mtlsTransporter) Dial(addr string, options ...DialOption) (conn net.Co
 	defer tr.sessionMutex.Unlock()
 
 	session, ok := tr.sessions[addr]
-	if session != nil && session.session != nil && session.session.IsClosed() {
-		session.Close()
+	if session != nil && session.IsClosed() {
 		delete(tr.sessions, addr)
-		ok = false
+		ok = false // session is dead
 	}
 	if !ok {
+		timeout := opts.Timeout
+		if timeout <= 0 {
+			timeout = DialTimeout
+		}
+
 		if opts.Chain == nil {
-			conn, err = net.DialTimeout("tcp", addr, opts.Timeout)
+			conn, err = net.DialTimeout("tcp", addr, timeout)
 		} else {
 			conn, err = opts.Chain.Dial(addr)
 		}
@@ -82,8 +92,16 @@ func (tr *mtlsTransporter) Handshake(conn net.Conn, options ...HandshakeOption) 
 		option(opts)
 	}
 
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = HandshakeTimeout
+	}
+
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
+
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
 
 	session, ok := tr.sessions[opts.Addr]
 	if !ok || session.session == nil {
@@ -140,10 +158,12 @@ func TLSListener(addr string, config *tls.Config) (Listener, error) {
 	if config == nil {
 		config = DefaultTLSConfig
 	}
-	ln, err := tls.Listen("tcp", addr, config)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+
+	ln = tls.NewListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, config)
 	return &tlsListener{ln}, nil
 }
 
@@ -158,13 +178,13 @@ func MTLSListener(addr string, config *tls.Config) (Listener, error) {
 	if config == nil {
 		config = DefaultTLSConfig
 	}
-	ln, err := tls.Listen("tcp", addr, config)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
 	l := &mtlsListener{
-		ln:       ln,
+		ln:       tls.NewListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, config),
 		connChan: make(chan net.Conn, 1024),
 		errChan:  make(chan error, 1),
 	}
@@ -252,23 +272,14 @@ func wrapTLSClient(conn net.Conn, tlsConfig *tls.Config, timeout time.Duration) 
 	var err error
 	var tlsConn *tls.Conn
 
-	tlsConn = tls.Client(conn, tlsConfig)
-
-	// If crypto/tls is doing verification, there's no need to do our own.
-	if tlsConfig.InsecureSkipVerify == false {
-		return tlsConn, nil
-	}
-
-	// Similarly if we use host's CA, we can do full handshake
-	if tlsConfig.RootCAs == nil {
-		return tlsConn, nil
-	}
-
 	if timeout <= 0 {
-		timeout = 10 * time.Second // default timeout
+		timeout = HandshakeTimeout // default timeout
 	}
 
-	tlsConn.SetDeadline(time.Now().Add(timeout))
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
+
+	tlsConn = tls.Client(conn, tlsConfig)
 
 	// Otherwise perform handshake, but don't verify the domain
 	//
@@ -279,7 +290,15 @@ func wrapTLSClient(conn net.Conn, tlsConfig *tls.Config, timeout time.Duration) 
 		return nil, err
 	}
 
-	tlsConn.SetDeadline(time.Time{}) // clear timeout
+	// If crypto/tls is doing verification, there's no need to do our own.
+	if tlsConfig.InsecureSkipVerify == false {
+		return tlsConn, nil
+	}
+
+	// Similarly if we use host's CA, we can do full handshake
+	if tlsConfig.RootCAs == nil {
+		return tlsConn, nil
+	}
 
 	opts := x509.VerifyOptions{
 		Roots:         tlsConfig.RootCAs,

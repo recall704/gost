@@ -3,15 +3,20 @@ package gost
 import (
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/go-log/log"
 )
 
+// Accepter represents a network endpoint that can accept connection from peer.
+type Accepter interface {
+	Accept() (net.Conn, error)
+}
+
 // Server is a proxy server.
 type Server struct {
 	Listener Listener
+	Handler  Handler
 	options  *ServerOptions
 }
 
@@ -45,6 +50,10 @@ func (s *Server) Serve(h Handler, opts ...ServerOption) error {
 			return err
 		}
 		s.Listener = ln
+	}
+
+	if h == nil {
+		h = s.Handler
 	}
 	if h == nil {
 		h = HTTPHandler()
@@ -84,22 +93,17 @@ func (s *Server) Serve(h Handler, opts ...ServerOption) error {
 	}
 }
 
+// Run starts to serve.
+func (s *Server) Run() error {
+	return s.Serve(s.Handler)
+}
+
 // ServerOptions holds the options for Server.
 type ServerOptions struct {
-	Bypass *Bypass
 }
 
 // ServerOption allows a common way to set server options.
 type ServerOption func(opts *ServerOptions)
-
-/*
-// BypassServerOption sets the bypass option of ServerOptions.
-func BypassServerOption(bypass *Bypass) ServerOption {
-	return func(opts *ServerOptions) {
-		opts.Bypass = bypass
-	}
-}
-*/
 
 // Listener is a proxy server listener, just like a net.Listener.
 type Listener interface {
@@ -137,27 +141,19 @@ func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
 	return tc, nil
 }
 
-var (
-	trPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 32*1024)
-		},
-	}
-)
-
 func transport(rw1, rw2 io.ReadWriter) error {
 	errc := make(chan error, 1)
 	go func() {
-		buf := trPool.Get().([]byte)
-		defer trPool.Put(buf)
+		buf := lPool.Get().([]byte)
+		defer lPool.Put(buf)
 
 		_, err := io.CopyBuffer(rw1, rw2, buf)
 		errc <- err
 	}()
 
 	go func() {
-		buf := trPool.Get().([]byte)
-		defer trPool.Put(buf)
+		buf := lPool.Get().([]byte)
+		defer lPool.Put(buf)
 
 		_, err := io.CopyBuffer(rw2, rw1, buf)
 		errc <- err

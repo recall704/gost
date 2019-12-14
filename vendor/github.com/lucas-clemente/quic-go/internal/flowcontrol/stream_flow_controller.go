@@ -5,8 +5,8 @@ import (
 
 	"github.com/lucas-clemente/quic-go/internal/congestion"
 	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
 	"github.com/lucas-clemente/quic-go/internal/utils"
+	"github.com/lucas-clemente/quic-go/qerr"
 )
 
 type streamFlowController struct {
@@ -16,7 +16,8 @@ type streamFlowController struct {
 
 	queueWindowUpdate func()
 
-	connection connectionFlowControllerI
+	connection              connectionFlowControllerI
+	contributesToConnection bool // does the stream contribute to connection level flow control
 
 	receivedFinalOffset bool
 }
@@ -26,6 +27,7 @@ var _ StreamFlowController = &streamFlowController{}
 // NewStreamFlowController gets a new flow controller for a stream
 func NewStreamFlowController(
 	streamID protocol.StreamID,
+	contributesToConnection bool,
 	cfc ConnectionFlowController,
 	receiveWindow protocol.ByteCount,
 	maxReceiveWindow protocol.ByteCount,
@@ -35,9 +37,10 @@ func NewStreamFlowController(
 	logger utils.Logger,
 ) StreamFlowController {
 	return &streamFlowController{
-		streamID:          streamID,
-		connection:        cfc.(connectionFlowControllerI),
-		queueWindowUpdate: func() { queueWindowUpdate(streamID) },
+		streamID:                streamID,
+		contributesToConnection: contributesToConnection,
+		connection:              cfc.(connectionFlowControllerI),
+		queueWindowUpdate:       func() { queueWindowUpdate(streamID) },
 		baseFlowController: baseFlowController{
 			rttStats:             rttStats,
 			receiveWindow:        receiveWindow,
@@ -84,21 +87,32 @@ func (c *streamFlowController) UpdateHighestReceived(byteOffset protocol.ByteCou
 	if c.checkFlowControlViolation() {
 		return qerr.Error(qerr.FlowControlReceivedTooMuchData, fmt.Sprintf("Received %d bytes on stream %d, allowed %d bytes", byteOffset, c.streamID, c.receiveWindow))
 	}
-	return c.connection.IncrementHighestReceived(increment)
+	if c.contributesToConnection {
+		return c.connection.IncrementHighestReceived(increment)
+	}
+	return nil
 }
 
 func (c *streamFlowController) AddBytesRead(n protocol.ByteCount) {
 	c.baseFlowController.AddBytesRead(n)
-	c.connection.AddBytesRead(n)
+	if c.contributesToConnection {
+		c.connection.AddBytesRead(n)
+	}
 }
 
 func (c *streamFlowController) AddBytesSent(n protocol.ByteCount) {
 	c.baseFlowController.AddBytesSent(n)
-	c.connection.AddBytesSent(n)
+	if c.contributesToConnection {
+		c.connection.AddBytesSent(n)
+	}
 }
 
 func (c *streamFlowController) SendWindowSize() protocol.ByteCount {
-	return utils.MinByteCount(c.baseFlowController.sendWindowSize(), c.connection.SendWindowSize())
+	window := c.baseFlowController.sendWindowSize()
+	if c.contributesToConnection {
+		window = utils.MinByteCount(window, c.connection.SendWindowSize())
+	}
+	return window
 }
 
 func (c *streamFlowController) MaybeQueueWindowUpdate() {
@@ -108,7 +122,9 @@ func (c *streamFlowController) MaybeQueueWindowUpdate() {
 	if hasWindowUpdate {
 		c.queueWindowUpdate()
 	}
-	c.connection.MaybeQueueWindowUpdate()
+	if c.contributesToConnection {
+		c.connection.MaybeQueueWindowUpdate()
+	}
 }
 
 func (c *streamFlowController) GetWindowUpdate() protocol.ByteCount {
@@ -124,7 +140,9 @@ func (c *streamFlowController) GetWindowUpdate() protocol.ByteCount {
 	offset := c.baseFlowController.getWindowUpdate()
 	if c.receiveWindowSize > oldWindowSize { // auto-tuning enlarged the window size
 		c.logger.Debugf("Increasing receive flow control window for stream %d to %d kB", c.streamID, c.receiveWindowSize/(1<<10))
-		c.connection.EnsureMinimumWindowSize(protocol.ByteCount(float64(c.receiveWindowSize) * protocol.ConnectionFlowControlMultiplier))
+		if c.contributesToConnection {
+			c.connection.EnsureMinimumWindowSize(protocol.ByteCount(float64(c.receiveWindowSize) * protocol.ConnectionFlowControlMultiplier))
+		}
 	}
 	c.mutex.Unlock()
 	return offset

@@ -21,7 +21,7 @@ type quicSession struct {
 }
 
 func (session *quicSession) GetConn() (*quicConn, error) {
-	stream, err := session.session.OpenStream()
+	stream, err := session.session.OpenStreamSync()
 	if err != nil {
 		return nil, err
 	}
@@ -54,6 +54,11 @@ func QUICTransporter(config *QUICConfig) Transporter {
 }
 
 func (tr *quicTransporter) Dial(addr string, options ...DialOption) (conn net.Conn, err error) {
+	opts := &DialOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
 
@@ -91,6 +96,13 @@ func (tr *quicTransporter) Handshake(conn net.Conn, options ...HandshakeOption) 
 
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = HandshakeTimeout
+	}
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
 
 	session, ok := tr.sessions[opts.Addr]
 	if session != nil && session.conn != conn {
@@ -130,10 +142,14 @@ func (tr *quicTransporter) initSession(addr string, conn net.Conn, config *QUICC
 		HandshakeTimeout: config.Timeout,
 		KeepAlive:        config.KeepAlive,
 		IdleTimeout:      config.IdleTimeout,
+		Versions: []quic.VersionNumber{
+			quic.VersionGQUIC43,
+			quic.VersionGQUIC39,
+		},
 	}
 	session, err := quic.Dial(udpConn, udpAddr, addr, config.TLSConfig, quicConfig)
 	if err != nil {
-		log.Log("quic dial:", err)
+		log.Logf("quic dial %s: %v", addr, err)
 		return nil, err
 	}
 	return &quicSession{conn: conn, session: session}, nil

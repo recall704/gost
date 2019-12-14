@@ -6,15 +6,37 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/ioutil"
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/ginuerzh/gost"
 )
+
+var (
+	routers []router
+)
+
+type baseConfig struct {
+	route
+	Routes []route
+	Debug  bool
+}
+
+func parseBaseConfig(s string) (*baseConfig, error) {
+	file, err := os.Open(s)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	if err := json.NewDecoder(file).Decode(baseCfg); err != nil {
+		return nil, err
+	}
+
+	return baseCfg, nil
+}
 
 var (
 	defaultCertFile = "cert.pem"
@@ -23,12 +45,10 @@ var (
 
 // Load the certificate from cert and key files, will use the default certificate if the provided info are invalid.
 func tlsConfig(certFile, keyFile string) (*tls.Config, error) {
-	if certFile == "" {
-		certFile = defaultCertFile
+	if certFile == "" || keyFile == "" {
+		certFile, keyFile = defaultCertFile, defaultKeyFile
 	}
-	if keyFile == "" {
-		keyFile = defaultKeyFile
-	}
+
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, err
@@ -49,45 +69,6 @@ func loadCA(caFile string) (cp *x509.CertPool, err error) {
 		return nil, errors.New("AppendCertsFromPEM failed")
 	}
 	return
-}
-
-func loadConfigureFile(configureFile string) error {
-	if configureFile == "" {
-		return nil
-	}
-	content, err := ioutil.ReadFile(configureFile)
-	if err != nil {
-		return err
-	}
-	var cfg struct {
-		route
-		Routes []route
-	}
-	if err := json.Unmarshal(content, &cfg); err != nil {
-		return err
-	}
-
-	if len(cfg.route.ServeNodes) > 0 {
-		routes = append(routes, cfg.route)
-	}
-	for _, route := range cfg.Routes {
-		if len(route.ServeNodes) > 0 {
-			routes = append(routes, route)
-		}
-	}
-	gost.Debug = cfg.Debug
-
-	return nil
-}
-
-type stringList []string
-
-func (l *stringList) String() string {
-	return fmt.Sprintf("%s", *l)
-}
-func (l *stringList) Set(value string) error {
-	*l = append(*l, value)
-	return nil
 }
 
 func parseKCPConfig(configFile string) (*gost.KCPConfig, error) {
@@ -135,6 +116,24 @@ func parseUsers(authFile string) (users []*url.Userinfo, err error) {
 	return
 }
 
+func parseAuthenticator(s string) (gost.Authenticator, error) {
+	if s == "" {
+		return nil, nil
+	}
+	f, err := os.Open(s)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	au := gost.NewLocalAuthenticator(nil)
+	au.Reload(f)
+
+	go gost.PeriodReload(au, s)
+
+	return au, nil
+}
+
 func parseIP(s string, port string) (ips []string) {
 	if s == "" {
 		return
@@ -149,6 +148,7 @@ func parseIP(s string, port string) (ips []string) {
 		for _, s := range ss {
 			s = strings.TrimSpace(s)
 			if s != "" {
+				// TODO: support IPv6
 				if !strings.Contains(s, ":") {
 					s = s + ":" + port
 				}
@@ -195,9 +195,10 @@ func parseBypass(s string) *gost.Bypass {
 		}
 		return gost.NewBypass(reversed, matchers...)
 	}
-	f.Close()
+	defer f.Close()
 
 	bp := gost.NewBypass(reversed)
+	bp.Reload(f)
 	go gost.PeriodReload(bp, s)
 
 	return bp
@@ -207,8 +208,6 @@ func parseResolver(cfg string) gost.Resolver {
 	if cfg == "" {
 		return nil
 	}
-	timeout := 30 * time.Second
-	ttl := 60 * time.Second
 	var nss []gost.NameServer
 
 	f, err := os.Open(cfg)
@@ -218,25 +217,59 @@ func parseResolver(cfg string) gost.Resolver {
 			if s == "" {
 				continue
 			}
+			if strings.HasPrefix(s, "https") {
+				ns := gost.NameServer{
+					Addr:     s,
+					Protocol: "https",
+				}
+				if err := ns.Init(); err == nil {
+					nss = append(nss, ns)
+				}
+				continue
+			}
+
 			ss := strings.Split(s, "/")
 			if len(ss) == 1 {
-				nss = append(nss, gost.NameServer{
+				ns := gost.NameServer{
 					Addr: ss[0],
-				})
+				}
+				if err := ns.Init(); err == nil {
+					nss = append(nss, ns)
+				}
 			}
 			if len(ss) == 2 {
-				nss = append(nss, gost.NameServer{
+				ns := gost.NameServer{
 					Addr:     ss[0],
 					Protocol: ss[1],
-				})
+				}
+				if err := ns.Init(); err == nil {
+					nss = append(nss, ns)
+				}
 			}
 		}
-		return gost.NewResolver(timeout, ttl, nss...)
+		return gost.NewResolver(0, nss...)
 	}
-	f.Close()
+	defer f.Close()
 
-	resolver := gost.NewResolver(timeout, ttl)
+	resolver := gost.NewResolver(0)
+	resolver.Reload(f)
+
 	go gost.PeriodReload(resolver, cfg)
 
 	return resolver
+}
+
+func parseHosts(s string) *gost.Hosts {
+	f, err := os.Open(s)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	hosts := gost.NewHosts()
+	hosts.Reload(f)
+
+	go gost.PeriodReload(hosts, s)
+
+	return hosts
 }

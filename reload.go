@@ -14,38 +14,52 @@ type Reloader interface {
 	Period() time.Duration
 }
 
-// PeriodReload reloads the config periodically according to the period of the reloader.
-func PeriodReload(r Reloader, configFile string) error {
-	var lastMod time.Time
+// Stoppable is the interface that indicates a Reloader can be stopped.
+type Stoppable interface {
+	Stop()
+	Stopped() bool
+}
 
+// PeriodReload reloads the config configFile periodically according to the period of the Reloader r.
+func PeriodReload(r Reloader, configFile string) error {
+	if r == nil || configFile == "" {
+		return nil
+	}
+
+	var lastMod time.Time
 	for {
+		if r.Period() < 0 {
+			log.Log("[reload] stopped:", configFile)
+			return nil
+		}
+
 		f, err := os.Open(configFile)
 		if err != nil {
 			return err
 		}
 
-		finfo, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return err
+		mt := lastMod
+		if finfo, err := f.Stat(); err == nil {
+			mt = finfo.ModTime()
 		}
-		mt := finfo.ModTime()
-		if !mt.Equal(lastMod) {
+
+		if !lastMod.IsZero() && !mt.Equal(lastMod) {
 			log.Log("[reload]", configFile)
-			r.Reload(f)
-			lastMod = mt
+			if err := r.Reload(f); err != nil {
+				log.Logf("[reload] %s: %s", configFile, err)
+			}
 		}
 		f.Close()
+		lastMod = mt
 
 		period := r.Period()
-		if period <= 0 {
+		if period == 0 {
 			log.Log("[reload] disabled:", configFile)
 			return nil
 		}
 		if period < time.Second {
 			period = time.Second
 		}
-
 		<-time.After(period)
 	}
 }

@@ -95,7 +95,7 @@ func DomainMatcher(pattern string) Matcher {
 	p := pattern
 	if strings.HasPrefix(pattern, ".") {
 		p = pattern[1:] // trim the prefix '.'
-		pattern = "*" + pattern
+		pattern = "*" + p
 	}
 	return &domainMatcher{
 		pattern: p,
@@ -122,8 +122,9 @@ func (m *domainMatcher) String() string {
 // It contains a list of matchers.
 type Bypass struct {
 	matchers []Matcher
-	reversed bool
 	period   time.Duration // the period for live reloading
+	reversed bool
+	stopped  chan struct{}
 	mux      sync.RWMutex
 }
 
@@ -133,6 +134,7 @@ func NewBypass(reversed bool, matchers ...Matcher) *Bypass {
 	return &Bypass{
 		matchers: matchers,
 		reversed: reversed,
+		stopped:  make(chan struct{}),
 	}
 }
 
@@ -141,18 +143,21 @@ func NewBypass(reversed bool, matchers ...Matcher) *Bypass {
 func NewBypassPatterns(reversed bool, patterns ...string) *Bypass {
 	var matchers []Matcher
 	for _, pattern := range patterns {
-		if pattern != "" {
-			matchers = append(matchers, NewMatcher(pattern))
+		if m := NewMatcher(pattern); m != nil {
+			matchers = append(matchers, m)
 		}
 	}
-	return NewBypass(reversed, matchers...)
+	bp := NewBypass(reversed)
+	bp.AddMatchers(matchers...)
+	return bp
 }
 
 // Contains reports whether the bypass includes addr.
 func (bp *Bypass) Contains(addr string) bool {
-	if bp == nil {
+	if bp == nil || addr == "" {
 		return false
 	}
+
 	// try to strip the port
 	if host, port, _ := net.SplitHostPort(addr); host != "" && port != "" {
 		if p, _ := strconv.Atoi(port); p > 0 { // port is valid
@@ -162,6 +167,10 @@ func (bp *Bypass) Contains(addr string) bool {
 
 	bp.mux.RLock()
 	defer bp.mux.RUnlock()
+
+	if len(bp.matchers) == 0 {
+		return false
+	}
 
 	var matched bool
 	for _, matcher := range bp.matchers {
@@ -207,47 +216,29 @@ func (bp *Bypass) Reload(r io.Reader) error {
 	var period time.Duration
 	var reversed bool
 
+	if r == nil || bp.Stopped() {
+		return nil
+	}
+
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if n := strings.IndexByte(line, '#'); n >= 0 {
-			line = line[:n]
-		}
-		line = strings.Replace(line, "\t", " ", -1)
-		line = strings.TrimSpace(line)
-		if line == "" {
+		ss := splitLine(line)
+		if len(ss) == 0 {
 			continue
 		}
-
-		// reload option
-		if strings.HasPrefix(line, "reload ") {
-			var ss []string
-			for _, s := range strings.Split(line, " ") {
-				if s = strings.TrimSpace(s); s != "" {
-					ss = append(ss, s)
-				}
-			}
-			if len(ss) == 2 {
+		switch ss[0] {
+		case "reload": // reload option
+			if len(ss) > 1 {
 				period, _ = time.ParseDuration(ss[1])
-				continue
 			}
-		}
-
-		// reverse option
-		if strings.HasPrefix(line, "reverse ") {
-			var ss []string
-			for _, s := range strings.Split(line, " ") {
-				if s = strings.TrimSpace(s); s != "" {
-					ss = append(ss, s)
-				}
-			}
-			if len(ss) == 2 {
+		case "reverse": // reverse option
+			if len(ss) > 1 {
 				reversed, _ = strconv.ParseBool(ss[1])
-				continue
 			}
+		default:
+			matchers = append(matchers, NewMatcher(ss[0]))
 		}
-
-		matchers = append(matchers, NewMatcher(line))
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -264,22 +255,42 @@ func (bp *Bypass) Reload(r io.Reader) error {
 	return nil
 }
 
-// Period returns the reload period
+// Period returns the reload period.
 func (bp *Bypass) Period() time.Duration {
+	if bp.Stopped() {
+		return -1
+	}
+
 	bp.mux.RLock()
 	defer bp.mux.RUnlock()
 
 	return bp.period
 }
 
-func (bp *Bypass) String() string {
-	bp.mux.RLock()
-	defer bp.mux.RUnlock()
+// Stop stops reloading.
+func (bp *Bypass) Stop() {
+	select {
+	case <-bp.stopped:
+	default:
+		close(bp.stopped)
+	}
+}
 
+// Stopped checks whether the reloader is stopped.
+func (bp *Bypass) Stopped() bool {
+	select {
+	case <-bp.stopped:
+		return true
+	default:
+		return false
+	}
+}
+
+func (bp *Bypass) String() string {
 	b := &bytes.Buffer{}
-	fmt.Fprintf(b, "reversed: %v\n", bp.reversed)
-	fmt.Fprintf(b, "reload: %v\n", bp.period)
-	for _, m := range bp.matchers {
+	fmt.Fprintf(b, "reversed: %v\n", bp.Reversed())
+	fmt.Fprintf(b, "reload: %v\n", bp.Period())
+	for _, m := range bp.Matchers() {
 		b.WriteString(m.String())
 		b.WriteByte('\n')
 	}

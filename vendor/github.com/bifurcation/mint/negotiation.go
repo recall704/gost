@@ -9,9 +9,9 @@ import (
 
 func VersionNegotiation(offered, supported []uint16) (bool, uint16) {
 	for _, offeredVersion := range offered {
-		for _, supportedVersion := range supported {
-			logf(logTypeHandshake, "[server] version offered by client [%04x] <> [%04x]", offeredVersion, supportedVersion)
-			if offeredVersion == supportedVersion {
+		for _, tls13Version := range supported {
+			logf(logTypeHandshake, "[server] version offered by client [%04x] <> [%04x]", offeredVersion, tls13Version)
+			if offeredVersion == tls13Version {
 				// XXX: Should probably be highest supported version, but for now, we
 				// only support one version, so it doesn't really matter.
 				return true, offeredVersion
@@ -148,7 +148,7 @@ func CertificateSelection(serverName *string, signatureSchemes []SignatureScheme
 		}
 
 		if len(candidatesByName) == 0 {
-			return nil, 0, fmt.Errorf("No certificates available for server name")
+			return nil, 0, fmt.Errorf("No certificates available for server name: %s", *serverName)
 		}
 
 		candidates = candidatesByName
@@ -168,10 +168,11 @@ func CertificateSelection(serverName *string, signatureSchemes []SignatureScheme
 	return nil, 0, fmt.Errorf("No certificates compatible with signature schemes")
 }
 
-func EarlyDataNegotiation(usingPSK, gotEarlyData, allowEarlyData bool) bool {
-	usingEarlyData := gotEarlyData && usingPSK && allowEarlyData
-	logf(logTypeNegotiation, "Early data negotiation (%v, %v, %v) => %v", usingPSK, gotEarlyData, allowEarlyData, usingEarlyData)
-	return usingEarlyData
+func EarlyDataNegotiation(usingPSK, gotEarlyData, allowEarlyData bool) (using bool, rejected bool) {
+	using = gotEarlyData && usingPSK && allowEarlyData
+	rejected = gotEarlyData && !using
+	logf(logTypeNegotiation, "Early data negotiation (%v, %v, %v) => %v, %v", usingPSK, gotEarlyData, allowEarlyData, using, rejected)
+	return
 }
 
 func CipherSuiteNegotiation(psk *PreSharedKey, offered, supported []CipherSuite) (CipherSuite, error) {
