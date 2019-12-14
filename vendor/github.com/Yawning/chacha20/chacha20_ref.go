@@ -5,6 +5,8 @@
 // Commons "CC0" public domain dedication. See LICENSE or
 // <http://creativecommons.org/publicdomain/zero/1.0/> for full details.
 
+// +build !go1.9
+
 package chacha20
 
 import (
@@ -16,7 +18,7 @@ import (
 func blocksRef(x *[stateSize]uint32, in []byte, out []byte, nrBlocks int, isIetf bool) {
 	if isIetf {
 		var totalBlocks uint64
-		totalBlocks = uint64(x[8]) + uint64(nrBlocks)
+		totalBlocks = uint64(x[12]) + uint64(nrBlocks)
 		if totalBlocks > math.MaxUint32 {
 			panic("chacha20: Exceeded keystream per nonce limit")
 		}

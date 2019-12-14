@@ -16,46 +16,6 @@ import (
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 )
 
-// Due to in/out byte length is inconsistent of the shadowsocks.Conn.Write,
-// we wrap around it to make io.Copy happy.
-type shadowConn struct {
-	conn net.Conn
-}
-
-func (c *shadowConn) Read(b []byte) (n int, err error) {
-	return c.conn.Read(b)
-}
-
-func (c *shadowConn) Write(b []byte) (n int, err error) {
-	n = len(b) // force byte length consistent
-	_, err = c.conn.Write(b)
-	return
-}
-
-func (c *shadowConn) Close() error {
-	return c.conn.Close()
-}
-
-func (c *shadowConn) LocalAddr() net.Addr {
-	return c.conn.LocalAddr()
-}
-
-func (c *shadowConn) RemoteAddr() net.Addr {
-	return c.conn.RemoteAddr()
-}
-
-func (c *shadowConn) SetDeadline(t time.Time) error {
-	return c.conn.SetDeadline(t)
-}
-
-func (c *shadowConn) SetReadDeadline(t time.Time) error {
-	return c.conn.SetReadDeadline(t)
-}
-
-func (c *shadowConn) SetWriteDeadline(t time.Time) error {
-	return c.conn.SetWriteDeadline(t)
-}
-
 type shadowConnector struct {
 	Cipher *url.Userinfo
 }
@@ -68,15 +28,32 @@ func ShadowConnector(cipher *url.Userinfo) Connector {
 }
 
 func (c *shadowConnector) Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error) {
+	opts := &ConnectOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = ConnectTimeout
+	}
+
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
+
 	rawaddr, err := ss.RawAddr(addr)
 	if err != nil {
 		return nil, err
 	}
 
 	var method, password string
-	if c.Cipher != nil {
-		method = c.Cipher.Username()
-		password, _ = c.Cipher.Password()
+	cp := opts.User
+	if cp == nil {
+		cp = c.Cipher
+	}
+	if cp != nil {
+		method = cp.Username()
+		password, _ = cp.Password()
 	}
 
 	cipher, err := ss.NewCipher(method, password)
@@ -84,11 +61,11 @@ func (c *shadowConnector) Connect(conn net.Conn, addr string, options ...Connect
 		return nil, err
 	}
 
-	sc, err := ss.DialWithRawAddrConn(rawaddr, conn, cipher)
-	if err != nil {
-		return nil, err
+	sc := &shadowConn{
+		Conn: ss.NewConn(conn, cipher),
 	}
-	return &shadowConn{conn: sc}, nil
+	_, err = sc.Write(rawaddr)
+	return sc, err
 }
 
 type shadowHandler struct {
@@ -124,49 +101,84 @@ func (h *shadowHandler) Handle(conn net.Conn) {
 	}
 	cipher, err := ss.NewCipher(method, password)
 	if err != nil {
-		log.Log("[ss]", err)
+		log.Logf("[ss] %s -> %s : %s",
+			conn.RemoteAddr(), conn.LocalAddr(), err)
 		return
 	}
-	conn = &shadowConn{conn: ss.NewConn(conn, cipher)}
-
-	log.Logf("[ss] %s - %s", conn.RemoteAddr(), conn.LocalAddr())
+	conn = &shadowConn{Conn: ss.NewConn(conn, cipher)}
 
 	conn.SetReadDeadline(time.Now().Add(ReadTimeout))
-	addr, err := h.getRequest(conn)
+	host, err := h.getRequest(conn)
 	if err != nil {
-		log.Logf("[ss] %s - %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
+		log.Logf("[ss] %s -> %s : %s",
+			conn.RemoteAddr(), conn.LocalAddr(), err)
 		return
 	}
 	// clear timer
 	conn.SetReadDeadline(time.Time{})
 
-	log.Logf("[ss] %s -> %s", conn.RemoteAddr(), addr)
+	log.Logf("[ss] %s -> %s -> %s",
+		conn.RemoteAddr(), h.options.Node.String(), host)
 
-	if !Can("tcp", addr, h.options.Whitelist, h.options.Blacklist) {
-		log.Logf("[ss] Unauthorized to tcp connect to %s", addr)
+	if !Can("tcp", host, h.options.Whitelist, h.options.Blacklist) {
+		log.Logf("[ss] %s - %s : Unauthorized to tcp connect to %s",
+			conn.RemoteAddr(), conn.LocalAddr(), host)
 		return
 	}
 
-	if h.options.Bypass.Contains(addr) {
-		log.Logf("[ss] [bypass] %s", addr)
+	if h.options.Bypass.Contains(host) {
+		log.Logf("[ss] %s - %s : Bypass %s",
+			conn.RemoteAddr(), conn.LocalAddr(), host)
 		return
 	}
 
-	cc, err := h.options.Chain.Dial(addr,
-		RetryChainOption(h.options.Retries),
-		TimeoutChainOption(h.options.Timeout),
-		HostsChainOption(h.options.Hosts),
-		ResolverChainOption(h.options.Resolver),
-	)
+	retries := 1
+	if h.options.Chain != nil && h.options.Chain.Retries > 0 {
+		retries = h.options.Chain.Retries
+	}
+	if h.options.Retries > 0 {
+		retries = h.options.Retries
+	}
+
+	var cc net.Conn
+	var route *Chain
+	for i := 0; i < retries; i++ {
+		route, err = h.options.Chain.selectRouteFor(host)
+		if err != nil {
+			log.Logf("[ss] %s -> %s : %s",
+				conn.RemoteAddr(), conn.LocalAddr(), err)
+			continue
+		}
+
+		buf := bytes.Buffer{}
+		fmt.Fprintf(&buf, "%s -> %s -> ",
+			conn.RemoteAddr(), h.options.Node.String())
+		for _, nd := range route.route {
+			fmt.Fprintf(&buf, "%d@%s -> ", nd.ID, nd.String())
+		}
+		fmt.Fprintf(&buf, "%s", host)
+		log.Log("[route]", buf.String())
+
+		cc, err = route.Dial(host,
+			TimeoutChainOption(h.options.Timeout),
+			HostsChainOption(h.options.Hosts),
+			ResolverChainOption(h.options.Resolver),
+		)
+		if err == nil {
+			break
+		}
+		log.Logf("[ss] %s -> %s : %s",
+			conn.RemoteAddr(), conn.LocalAddr(), err)
+	}
+
 	if err != nil {
-		log.Logf("[ss] %s -> %s : %s", conn.RemoteAddr(), addr, err)
 		return
 	}
 	defer cc.Close()
 
-	log.Logf("[ss] %s <-> %s", conn.RemoteAddr(), addr)
+	log.Logf("[ss] %s <-> %s", conn.RemoteAddr(), host)
 	transport(conn, cc)
-	log.Logf("[ss] %s >-< %s", conn.RemoteAddr(), addr)
+	log.Logf("[ss] %s >-< %s", conn.RemoteAddr(), host)
 }
 
 const (
@@ -233,6 +245,55 @@ func (h *shadowHandler) getRequest(r io.Reader) (host string, err error) {
 	port := binary.BigEndian.Uint16(buf[reqEnd-2 : reqEnd])
 	host = net.JoinHostPort(host, strconv.Itoa(int(port)))
 	return
+}
+
+type shadowUDPConnector struct {
+	Cipher *url.Userinfo
+}
+
+// ShadowUDPConnector creates a Connector for shadowsocks UDP client.
+// It accepts a cipher info for shadowsocks data encryption/decryption.
+// The cipher must not be nil.
+func ShadowUDPConnector(cipher *url.Userinfo) Connector {
+	return &shadowUDPConnector{Cipher: cipher}
+}
+
+func (c *shadowUDPConnector) Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error) {
+	opts := &ConnectOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = ConnectTimeout
+	}
+
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
+
+	rawaddr, err := ss.RawAddr(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	var method, password string
+	if c.Cipher != nil {
+		method = c.Cipher.Username()
+		password, _ = c.Cipher.Password()
+	}
+
+	cipher, err := ss.NewCipher(method, password)
+	if err != nil {
+		return nil, err
+	}
+
+	sc := ss.NewSecurePacketConn(&shadowPacketConn{conn}, cipher, false)
+	return &shadowUDPConn{
+		PacketConn: sc,
+		raddr:      conn.RemoteAddr(),
+		header:     rawaddr,
+	}, nil
 }
 
 type shadowUDPListener struct {
@@ -385,7 +446,13 @@ func (h *shadowUDPdHandler) transportUDP(sc net.Conn, cc net.PacketConn) error {
 	errc := make(chan error, 1)
 	go func() {
 		for {
-			b := make([]byte, mediumBufferSize)
+			b := mPool.Get().([]byte)
+			defer mPool.Put(b)
+
+			b[0] = 0
+			b[1] = 0
+			b[2] = 0
+
 			n, err := sc.Read(b[3:]) // add rsv and frag fields to make it the standard SOCKS5 UDP datagram
 			if err != nil {
 				// log.Logf("[ssu] %s - %s : %s", sc.RemoteAddr(), sc.LocalAddr(), err)
@@ -419,7 +486,9 @@ func (h *shadowUDPdHandler) transportUDP(sc net.Conn, cc net.PacketConn) error {
 
 	go func() {
 		for {
-			b := make([]byte, mediumBufferSize)
+			b := mPool.Get().([]byte)
+			defer mPool.Put(b)
+
 			n, addr, err := cc.ReadFrom(b)
 			if err != nil {
 				errc <- err
@@ -451,4 +520,82 @@ func (h *shadowUDPdHandler) transportUDP(sc net.Conn, cc net.PacketConn) error {
 		err = nil
 	}
 	return err
+}
+
+// Due to in/out byte length is inconsistent of the shadowsocks.Conn.Write,
+// we wrap around it to make io.Copy happy.
+type shadowConn struct {
+	wbuf bytes.Buffer
+	net.Conn
+}
+
+func (c *shadowConn) Write(b []byte) (n int, err error) {
+	n = len(b) // force byte length consistent
+
+	if c.wbuf.Len() > 0 {
+		c.wbuf.Write(b) // append the data to the cached header
+		_, err = c.Conn.Write(c.wbuf.Bytes())
+		c.wbuf.Reset()
+		return
+	}
+	_, err = c.Conn.Write(b)
+	return
+}
+
+type shadowUDPConn struct {
+	net.PacketConn
+	raddr  net.Addr
+	header []byte
+}
+
+func (c *shadowUDPConn) Write(b []byte) (n int, err error) {
+	n = len(b) // force byte length consistent
+	buf := bytes.Buffer{}
+	if _, err = buf.Write(c.header); err != nil {
+		return
+	}
+	if _, err = buf.Write(b); err != nil {
+		return
+	}
+	_, err = c.PacketConn.WriteTo(buf.Bytes(), c.raddr)
+	return
+}
+
+func (c *shadowUDPConn) Read(b []byte) (n int, err error) {
+	buf := mPool.Get().([]byte)
+	defer mPool.Put(buf)
+
+	buf[0] = 0
+	buf[1] = 0
+	buf[2] = 0
+
+	n, _, err = c.PacketConn.ReadFrom(buf[3:])
+	if err != nil {
+		return
+	}
+
+	dgram, err := gosocks5.ReadUDPDatagram(bytes.NewReader(buf[:n+3]))
+	if err != nil {
+		return
+	}
+	n = copy(b, dgram.Data)
+	return
+}
+
+func (c *shadowUDPConn) RemoteAddr() net.Addr {
+	return c.raddr
+}
+
+type shadowPacketConn struct {
+	net.Conn
+}
+
+func (c *shadowPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	n, err = c.Conn.Read(b)
+	addr = c.Conn.RemoteAddr()
+	return
+}
+
+func (c *shadowPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+	return c.Conn.Write(b)
 }

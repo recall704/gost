@@ -76,8 +76,7 @@ def WriteXor_sse2(tmp, inp, outp, d, v0, v1, v2, v3):
     MOVDQU([outp+d+48], tmp)
 
 # SSE2 ChaCha20 (aka vec128).  Does not handle partial blocks, and will
-# process 4/2/1 blocks at a time.  x (the ChaCha20 state) must be 16 byte
-# aligned.
+# process 4/2/1 blocks at a time.
 with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
     reg_x = GeneralPurposeRegister64()
     reg_inp = GeneralPurposeRegister64()
@@ -91,11 +90,8 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
     LOAD.ARGUMENT(reg_blocks, nrBlocks)
 
     # Align the stack to a 32 byte boundary.
-    reg_align = GeneralPurposeRegister64()
     MOV(reg_sp_save, registers.rsp)
-    MOV(reg_align, 0x1f)
-    NOT(reg_align)
-    AND(registers.rsp, reg_align)
+    AND(registers.rsp, 0xffffffffffffffe0)
     SUB(registers.rsp, 0x20)
 
     # Build the counter increment vector on the stack, and allocate the scratch
@@ -141,14 +137,16 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
     # 4 blocks at a time.
     #
 
+    reg_rounds = GeneralPurposeRegister64()
+
     vector_loop4 = Loop()
     SUB(reg_blocks, 4)
     JB(vector_loop4.end)
     with vector_loop4:
-        MOVDQA(xmm_v0, mem_s0)
-        MOVDQA(xmm_v1, mem_s1)
-        MOVDQA(xmm_v2, mem_s2)
-        MOVDQA(xmm_v3, mem_s3)
+        MOVDQU(xmm_v0, mem_s0)
+        MOVDQU(xmm_v1, mem_s1)
+        MOVDQU(xmm_v2, mem_s2)
+        MOVDQU(xmm_v3, mem_s3)
 
         MOVDQA(xmm_v4, xmm_v0)
         MOVDQA(xmm_v5, xmm_v1)
@@ -168,7 +166,6 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
         MOVDQA(xmm_v15, xmm_v11)
         PADDQ(xmm_v15, mem_one)
 
-        reg_rounds = GeneralPurposeRegister64()
         MOV(reg_rounds, 20)
         rounds_loop4 = Loop()
         with rounds_loop4:
@@ -342,7 +339,7 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
         PADDD(xmm_v2, mem_s2)
         PADDD(xmm_v3, mem_s3)
         WriteXor_sse2(xmm_tmp, reg_inp, reg_outp, 0, xmm_v0, xmm_v1, xmm_v2, xmm_v3)
-        MOVDQA(xmm_v3, mem_s3)
+        MOVDQU(xmm_v3, mem_s3)
         PADDQ(xmm_v3, mem_one)
 
         PADDD(xmm_v4, mem_s0)
@@ -368,7 +365,7 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
         WriteXor_sse2(xmm_v0, reg_inp, reg_outp, 192, xmm_v12, xmm_v13, xmm_v14, xmm_v15)
         PADDQ(xmm_v3, mem_one)
 
-        MOVDQA(mem_s3, xmm_v3)
+        MOVDQU(mem_s3, xmm_v3)
 
         ADD(reg_inp, 4 * 64)
         ADD(reg_outp, 4 * 64)
@@ -388,138 +385,136 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
     xmm_s2 = xmm_v10
     xmm_s3 = xmm_v11
     xmm_one = xmm_v13
-    MOVDQA(xmm_s0, mem_s0)
-    MOVDQA(xmm_s1, mem_s1)
-    MOVDQA(xmm_s2, mem_s2)
-    MOVDQA(xmm_s3, mem_s3)
+    MOVDQU(xmm_s0, mem_s0)
+    MOVDQU(xmm_s1, mem_s1)
+    MOVDQU(xmm_s2, mem_s2)
+    MOVDQU(xmm_s3, mem_s3)
     MOVDQA(xmm_one, mem_one)
 
     #
     # 2 blocks at a time.
     #
 
+    process_1_block = Label()
     SUB(reg_blocks, 2)
-    vector_loop2 = Loop()
-    JB(vector_loop2.end)
-    with vector_loop2:
-        MOVDQA(xmm_v0, xmm_s0)
-        MOVDQA(xmm_v1, xmm_s1)
-        MOVDQA(xmm_v2, xmm_s2)
-        MOVDQA(xmm_v3, xmm_s3)
+    JB(process_1_block) # < 2 blocks remaining.
 
-        MOVDQA(xmm_v4, xmm_v0)
-        MOVDQA(xmm_v5, xmm_v1)
-        MOVDQA(xmm_v6, xmm_v2)
-        MOVDQA(xmm_v7, xmm_v3)
-        PADDQ(xmm_v7, xmm_one)
+    MOVDQA(xmm_v0, xmm_s0)
+    MOVDQA(xmm_v1, xmm_s1)
+    MOVDQA(xmm_v2, xmm_s2)
+    MOVDQA(xmm_v3, xmm_s3)
 
-        reg_rounds = GeneralPurposeRegister64()
-        MOV(reg_rounds, 20)
-        rounds_loop2 = Loop()
-        with rounds_loop2:
-            # a += b; d ^= a; d = ROTW16(d);
-            PADDD(xmm_v0, xmm_v1)
-            PADDD(xmm_v4, xmm_v5)
-            PXOR(xmm_v3, xmm_v0)
-            PXOR(xmm_v7, xmm_v4)
-            ROTW16_sse2(xmm_tmp, xmm_v3)
-            ROTW16_sse2(xmm_tmp, xmm_v7)
+    MOVDQA(xmm_v4, xmm_v0)
+    MOVDQA(xmm_v5, xmm_v1)
+    MOVDQA(xmm_v6, xmm_v2)
+    MOVDQA(xmm_v7, xmm_v3)
+    PADDQ(xmm_v7, xmm_one)
 
-            # c += d; b ^= c; b = ROTW12(b);
-            PADDD(xmm_v2, xmm_v3)
-            PADDD(xmm_v6, xmm_v7)
-            PXOR(xmm_v1, xmm_v2)
-            PXOR(xmm_v5, xmm_v6)
-            ROTW12_sse2(xmm_tmp, xmm_v1)
-            ROTW12_sse2(xmm_tmp, xmm_v5)
+    MOV(reg_rounds, 20)
+    rounds_loop2 = Loop()
+    with rounds_loop2:
+        # a += b; d ^= a; d = ROTW16(d);
+        PADDD(xmm_v0, xmm_v1)
+        PADDD(xmm_v4, xmm_v5)
+        PXOR(xmm_v3, xmm_v0)
+        PXOR(xmm_v7, xmm_v4)
+        ROTW16_sse2(xmm_tmp, xmm_v3)
+        ROTW16_sse2(xmm_tmp, xmm_v7)
 
-            # a += b; d ^= a; d = ROTW8(d);
-            PADDD(xmm_v0, xmm_v1)
-            PADDD(xmm_v4, xmm_v5)
-            PXOR(xmm_v3, xmm_v0)
-            PXOR(xmm_v7, xmm_v4)
-            ROTW8_sse2(xmm_tmp, xmm_v3)
-            ROTW8_sse2(xmm_tmp, xmm_v7)
+        # c += d; b ^= c; b = ROTW12(b);
+        PADDD(xmm_v2, xmm_v3)
+        PADDD(xmm_v6, xmm_v7)
+        PXOR(xmm_v1, xmm_v2)
+        PXOR(xmm_v5, xmm_v6)
+        ROTW12_sse2(xmm_tmp, xmm_v1)
+        ROTW12_sse2(xmm_tmp, xmm_v5)
 
-            # c += d; b ^= c; b = ROTW7(b)
-            PADDD(xmm_v2, xmm_v3)
-            PADDD(xmm_v6, xmm_v7)
-            PXOR(xmm_v1, xmm_v2)
-            PXOR(xmm_v5, xmm_v6)
-            ROTW7_sse2(xmm_tmp, xmm_v1)
-            ROTW7_sse2(xmm_tmp, xmm_v5)
+        # a += b; d ^= a; d = ROTW8(d);
+        PADDD(xmm_v0, xmm_v1)
+        PADDD(xmm_v4, xmm_v5)
+        PXOR(xmm_v3, xmm_v0)
+        PXOR(xmm_v7, xmm_v4)
+        ROTW8_sse2(xmm_tmp, xmm_v3)
+        ROTW8_sse2(xmm_tmp, xmm_v7)
 
-            # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
-            PSHUFD(xmm_v1, xmm_v1, 0x39)
-            PSHUFD(xmm_v5, xmm_v5, 0x39)
-            PSHUFD(xmm_v2, xmm_v2, 0x4e)
-            PSHUFD(xmm_v6, xmm_v6, 0x4e)
-            PSHUFD(xmm_v3, xmm_v3, 0x93)
-            PSHUFD(xmm_v7, xmm_v7, 0x93)
+        # c += d; b ^= c; b = ROTW7(b)
+        PADDD(xmm_v2, xmm_v3)
+        PADDD(xmm_v6, xmm_v7)
+        PXOR(xmm_v1, xmm_v2)
+        PXOR(xmm_v5, xmm_v6)
+        ROTW7_sse2(xmm_tmp, xmm_v1)
+        ROTW7_sse2(xmm_tmp, xmm_v5)
 
-            # a += b; d ^= a; d = ROTW16(d);
-            PADDD(xmm_v0, xmm_v1)
-            PADDD(xmm_v4, xmm_v5)
-            PXOR(xmm_v3, xmm_v0)
-            PXOR(xmm_v7, xmm_v4)
-            ROTW16_sse2(xmm_tmp, xmm_v3)
-            ROTW16_sse2(xmm_tmp, xmm_v7)
+        # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
+        PSHUFD(xmm_v1, xmm_v1, 0x39)
+        PSHUFD(xmm_v5, xmm_v5, 0x39)
+        PSHUFD(xmm_v2, xmm_v2, 0x4e)
+        PSHUFD(xmm_v6, xmm_v6, 0x4e)
+        PSHUFD(xmm_v3, xmm_v3, 0x93)
+        PSHUFD(xmm_v7, xmm_v7, 0x93)
 
-            # c += d; b ^= c; b = ROTW12(b);
-            PADDD(xmm_v2, xmm_v3)
-            PADDD(xmm_v6, xmm_v7)
-            PXOR(xmm_v1, xmm_v2)
-            PXOR(xmm_v5, xmm_v6)
-            ROTW12_sse2(xmm_tmp, xmm_v1)
-            ROTW12_sse2(xmm_tmp, xmm_v5)
+        # a += b; d ^= a; d = ROTW16(d);
+        PADDD(xmm_v0, xmm_v1)
+        PADDD(xmm_v4, xmm_v5)
+        PXOR(xmm_v3, xmm_v0)
+        PXOR(xmm_v7, xmm_v4)
+        ROTW16_sse2(xmm_tmp, xmm_v3)
+        ROTW16_sse2(xmm_tmp, xmm_v7)
 
-            # a += b; d ^= a; d = ROTW8(d);
-            PADDD(xmm_v0, xmm_v1)
-            PADDD(xmm_v4, xmm_v5)
-            PXOR(xmm_v3, xmm_v0)
-            PXOR(xmm_v7, xmm_v4)
-            ROTW8_sse2(xmm_tmp, xmm_v3)
-            ROTW8_sse2(xmm_tmp, xmm_v7)
+        # c += d; b ^= c; b = ROTW12(b);
+        PADDD(xmm_v2, xmm_v3)
+        PADDD(xmm_v6, xmm_v7)
+        PXOR(xmm_v1, xmm_v2)
+        PXOR(xmm_v5, xmm_v6)
+        ROTW12_sse2(xmm_tmp, xmm_v1)
+        ROTW12_sse2(xmm_tmp, xmm_v5)
 
-            # c += d; b ^= c; b = ROTW7(b)
-            PADDD(xmm_v2, xmm_v3)
-            PADDD(xmm_v6, xmm_v7)
-            PXOR(xmm_v1, xmm_v2)
-            PXOR(xmm_v5, xmm_v6)
-            ROTW7_sse2(xmm_tmp, xmm_v1)
-            ROTW7_sse2(xmm_tmp, xmm_v5)
+        # a += b; d ^= a; d = ROTW8(d);
+        PADDD(xmm_v0, xmm_v1)
+        PADDD(xmm_v4, xmm_v5)
+        PXOR(xmm_v3, xmm_v0)
+        PXOR(xmm_v7, xmm_v4)
+        ROTW8_sse2(xmm_tmp, xmm_v3)
+        ROTW8_sse2(xmm_tmp, xmm_v7)
 
-            # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
-            PSHUFD(xmm_v1, xmm_v1, 0x93)
-            PSHUFD(xmm_v5, xmm_v5, 0x93)
-            PSHUFD(xmm_v2, xmm_v2, 0x4e)
-            PSHUFD(xmm_v6, xmm_v6, 0x4e)
-            PSHUFD(xmm_v3, xmm_v3, 0x39)
-            PSHUFD(xmm_v7, xmm_v7, 0x39)
+        # c += d; b ^= c; b = ROTW7(b)
+        PADDD(xmm_v2, xmm_v3)
+        PADDD(xmm_v6, xmm_v7)
+        PXOR(xmm_v1, xmm_v2)
+        PXOR(xmm_v5, xmm_v6)
+        ROTW7_sse2(xmm_tmp, xmm_v1)
+        ROTW7_sse2(xmm_tmp, xmm_v5)
 
-            SUB(reg_rounds, 2)
-            JNZ(rounds_loop2.begin)
+        # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
+        PSHUFD(xmm_v1, xmm_v1, 0x93)
+        PSHUFD(xmm_v5, xmm_v5, 0x93)
+        PSHUFD(xmm_v2, xmm_v2, 0x4e)
+        PSHUFD(xmm_v6, xmm_v6, 0x4e)
+        PSHUFD(xmm_v3, xmm_v3, 0x39)
+        PSHUFD(xmm_v7, xmm_v7, 0x39)
 
-        PADDD(xmm_v0, xmm_s0)
-        PADDD(xmm_v1, xmm_s1)
-        PADDD(xmm_v2, xmm_s2)
-        PADDD(xmm_v3, xmm_s3)
-        WriteXor_sse2(xmm_tmp, reg_inp, reg_outp, 0, xmm_v0, xmm_v1, xmm_v2, xmm_v3)
-        PADDQ(xmm_s3, xmm_one)
+        SUB(reg_rounds, 2)
+        JNZ(rounds_loop2.begin)
 
-        PADDD(xmm_v4, xmm_s0)
-        PADDD(xmm_v5, xmm_s1)
-        PADDD(xmm_v6, xmm_s2)
-        PADDD(xmm_v7, xmm_s3)
-        WriteXor_sse2(xmm_tmp, reg_inp, reg_outp, 64, xmm_v4, xmm_v5, xmm_v6, xmm_v7)
-        PADDQ(xmm_s3, xmm_one)
+    PADDD(xmm_v0, xmm_s0)
+    PADDD(xmm_v1, xmm_s1)
+    PADDD(xmm_v2, xmm_s2)
+    PADDD(xmm_v3, xmm_s3)
+    WriteXor_sse2(xmm_tmp, reg_inp, reg_outp, 0, xmm_v0, xmm_v1, xmm_v2, xmm_v3)
+    PADDQ(xmm_s3, xmm_one)
 
-        ADD(reg_inp, 2 * 64)
-        ADD(reg_outp, 2 * 64)
+    PADDD(xmm_v4, xmm_s0)
+    PADDD(xmm_v5, xmm_s1)
+    PADDD(xmm_v6, xmm_s2)
+    PADDD(xmm_v7, xmm_s3)
+    WriteXor_sse2(xmm_tmp, reg_inp, reg_outp, 64, xmm_v4, xmm_v5, xmm_v6, xmm_v7)
+    PADDQ(xmm_s3, xmm_one)
 
-        SUB(reg_blocks, 2)
-        JAE(vector_loop2.begin)
+    ADD(reg_inp, 2 * 64)
+    ADD(reg_outp, 2 * 64)
+    SUB(reg_blocks, 2)
 
+    LABEL(process_1_block)
     ADD(reg_blocks, 2)
     out_serial = Label()
     JZ(out_serial)
@@ -534,7 +529,6 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
     MOVDQA(xmm_v2, xmm_s2)
     MOVDQA(xmm_v3, xmm_s3)
 
-    reg_rounds = GeneralPurposeRegister64()
     MOV(reg_rounds, 20)
     rounds_loop1 = Loop()
     with rounds_loop1:
@@ -603,7 +597,7 @@ with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
     # Write back the updated counter.  Stoping at 2^70 bytes is the user's
     # problem, not mine.  (Skipped if there's exactly a multiple of 4 blocks
     # because the counter is incremented in memory while looping.)
-    MOVDQA(mem_s3, xmm_s3)
+    MOVDQU(mem_s3, xmm_s3)
 
     LABEL(out)
 
@@ -671,7 +665,7 @@ def WriteXor_avx2(tmp, inp, outp, d, v0, v1, v2, v3):
     VMOVDQU([outp+d+96], tmp)
 
 # AVX2 ChaCha20 (aka avx2).  Does not handle partial blocks, will process
-# 8/4/2 blocks at a time.  Alignment blah blah blah fuck you.
+# 8/4/2 blocks at a time.
 with Function("blocksAmd64AVX2", (x, inp, outp, nrBlocks), target=uarch.broadwell):
     reg_x = GeneralPurposeRegister64()
     reg_inp = GeneralPurposeRegister64()
@@ -685,11 +679,8 @@ with Function("blocksAmd64AVX2", (x, inp, outp, nrBlocks), target=uarch.broadwel
     LOAD.ARGUMENT(reg_blocks, nrBlocks)
 
     # Align the stack to a 32 byte boundary.
-    reg_align = GeneralPurposeRegister64()
     MOV(reg_sp_save, registers.rsp)
-    MOV(reg_align, 0x1f)
-    NOT(reg_align)
-    AND(registers.rsp, reg_align)
+    AND(registers.rsp, 0xffffffffffffffe0)
     SUB(registers.rsp, 0x20)
 
     x_s0 = [reg_x]           # (Memory) Cipher state [0..3]
@@ -750,6 +741,8 @@ with Function("blocksAmd64AVX2", (x, inp, outp, nrBlocks), target=uarch.broadwel
     # a decent gain despite all the pain...
     #
 
+    reg_rounds = GeneralPurposeRegister64()
+
     vector_loop8 = Loop()
     SUB(reg_blocks, 8)
     JB(vector_loop8.end)
@@ -774,7 +767,6 @@ with Function("blocksAmd64AVX2", (x, inp, outp, nrBlocks), target=uarch.broadwel
         VMOVDQA(ymm_v14, ymm_v2)
         VPADDQ(ymm_v15, ymm_v11, mem_inc)
 
-        reg_rounds = GeneralPurposeRegister64()
         MOV(reg_rounds, 20)
         rounds_loop8 = Loop()
         with rounds_loop8:
@@ -1012,129 +1004,127 @@ with Function("blocksAmd64AVX2", (x, inp, outp, nrBlocks), target=uarch.broadwel
     # 4 blocks at a time.
     #
 
+    process_2_blocks = Label()
     SUB(reg_blocks, 4)
-    vector_loop4 = Loop()
-    JB(vector_loop4.end)
-    with vector_loop4:
-        VMOVDQA(ymm_v0, ymm_s0)
-        VMOVDQA(ymm_v1, ymm_s1)
-        VMOVDQA(ymm_v2, ymm_s2)
-        VMOVDQA(ymm_v3, ymm_s3)
+    JB(process_2_blocks) # < 4 blocks remaining.
 
-        VMOVDQA(ymm_v4, ymm_v0)
-        VMOVDQA(ymm_v5, ymm_v1)
-        VMOVDQA(ymm_v6, ymm_v2)
-        VPADDQ(ymm_v7, ymm_v3, ymm_inc)
+    VMOVDQA(ymm_v0, ymm_s0)
+    VMOVDQA(ymm_v1, ymm_s1)
+    VMOVDQA(ymm_v2, ymm_s2)
+    VMOVDQA(ymm_v3, ymm_s3)
 
-        reg_rounds = GeneralPurposeRegister64()
-        MOV(reg_rounds, 20)
-        rounds_loop4 = Loop()
-        with rounds_loop4:
-            # a += b; d ^= a; d = ROTW16(d);
-            ADD_avx2(ymm_v0, ymm_v1)
-            ADD_avx2(ymm_v4, ymm_v5)
-            XOR_avx2(ymm_v3, ymm_v0)
-            XOR_avx2(ymm_v7, ymm_v4)
-            ROTW16_avx2(ymm_tmp0, ymm_v3)
-            ROTW16_avx2(ymm_tmp0, ymm_v7)
+    VMOVDQA(ymm_v4, ymm_v0)
+    VMOVDQA(ymm_v5, ymm_v1)
+    VMOVDQA(ymm_v6, ymm_v2)
+    VPADDQ(ymm_v7, ymm_v3, ymm_inc)
 
-            # c += d; b ^= c; b = ROTW12(b);
-            ADD_avx2(ymm_v2, ymm_v3)
-            ADD_avx2(ymm_v6, ymm_v7)
-            XOR_avx2(ymm_v1, ymm_v2)
-            XOR_avx2(ymm_v5, ymm_v6)
-            ROTW12_avx2(ymm_tmp0, ymm_v1)
-            ROTW12_avx2(ymm_tmp0, ymm_v5)
+    MOV(reg_rounds, 20)
+    rounds_loop4 = Loop()
+    with rounds_loop4:
+        # a += b; d ^= a; d = ROTW16(d);
+        ADD_avx2(ymm_v0, ymm_v1)
+        ADD_avx2(ymm_v4, ymm_v5)
+        XOR_avx2(ymm_v3, ymm_v0)
+        XOR_avx2(ymm_v7, ymm_v4)
+        ROTW16_avx2(ymm_tmp0, ymm_v3)
+        ROTW16_avx2(ymm_tmp0, ymm_v7)
 
-            # a += b; d ^= a; d = ROTW8(d);
-            ADD_avx2(ymm_v0, ymm_v1)
-            ADD_avx2(ymm_v4, ymm_v5)
-            XOR_avx2(ymm_v3, ymm_v0)
-            XOR_avx2(ymm_v7, ymm_v4)
-            ROTW8_avx2(ymm_tmp0, ymm_v3)
-            ROTW8_avx2(ymm_tmp0, ymm_v7)
+        # c += d; b ^= c; b = ROTW12(b);
+        ADD_avx2(ymm_v2, ymm_v3)
+        ADD_avx2(ymm_v6, ymm_v7)
+        XOR_avx2(ymm_v1, ymm_v2)
+        XOR_avx2(ymm_v5, ymm_v6)
+        ROTW12_avx2(ymm_tmp0, ymm_v1)
+        ROTW12_avx2(ymm_tmp0, ymm_v5)
 
-            # c += d; b ^= c; b = ROTW7(b)
-            ADD_avx2(ymm_v2, ymm_v3)
-            ADD_avx2(ymm_v6, ymm_v7)
-            XOR_avx2(ymm_v1, ymm_v2)
-            XOR_avx2(ymm_v5, ymm_v6)
-            ROTW7_avx2(ymm_tmp0, ymm_v1)
-            ROTW7_avx2(ymm_tmp0, ymm_v5)
+        # a += b; d ^= a; d = ROTW8(d);
+        ADD_avx2(ymm_v0, ymm_v1)
+        ADD_avx2(ymm_v4, ymm_v5)
+        XOR_avx2(ymm_v3, ymm_v0)
+        XOR_avx2(ymm_v7, ymm_v4)
+        ROTW8_avx2(ymm_tmp0, ymm_v3)
+        ROTW8_avx2(ymm_tmp0, ymm_v7)
 
-            # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
-            VPSHUFD(ymm_v1, ymm_v1, 0x39)
-            VPSHUFD(ymm_v5, ymm_v5, 0x39)
-            VPSHUFD(ymm_v2, ymm_v2, 0x4e)
-            VPSHUFD(ymm_v6, ymm_v6, 0x4e)
-            VPSHUFD(ymm_v3, ymm_v3, 0x93)
-            VPSHUFD(ymm_v7, ymm_v7, 0x93)
+        # c += d; b ^= c; b = ROTW7(b)
+        ADD_avx2(ymm_v2, ymm_v3)
+        ADD_avx2(ymm_v6, ymm_v7)
+        XOR_avx2(ymm_v1, ymm_v2)
+        XOR_avx2(ymm_v5, ymm_v6)
+        ROTW7_avx2(ymm_tmp0, ymm_v1)
+        ROTW7_avx2(ymm_tmp0, ymm_v5)
 
-            # a += b; d ^= a; d = ROTW16(d);
-            ADD_avx2(ymm_v0, ymm_v1)
-            ADD_avx2(ymm_v4, ymm_v5)
-            XOR_avx2(ymm_v3, ymm_v0)
-            XOR_avx2(ymm_v7, ymm_v4)
-            ROTW16_avx2(ymm_tmp0, ymm_v3)
-            ROTW16_avx2(ymm_tmp0, ymm_v7)
+        # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
+        VPSHUFD(ymm_v1, ymm_v1, 0x39)
+        VPSHUFD(ymm_v5, ymm_v5, 0x39)
+        VPSHUFD(ymm_v2, ymm_v2, 0x4e)
+        VPSHUFD(ymm_v6, ymm_v6, 0x4e)
+        VPSHUFD(ymm_v3, ymm_v3, 0x93)
+        VPSHUFD(ymm_v7, ymm_v7, 0x93)
 
-            # c += d; b ^= c; b = ROTW12(b);
-            ADD_avx2(ymm_v2, ymm_v3)
-            ADD_avx2(ymm_v6, ymm_v7)
-            XOR_avx2(ymm_v1, ymm_v2)
-            XOR_avx2(ymm_v5, ymm_v6)
-            ROTW12_avx2(ymm_tmp0, ymm_v1)
-            ROTW12_avx2(ymm_tmp0, ymm_v5)
+        # a += b; d ^= a; d = ROTW16(d);
+        ADD_avx2(ymm_v0, ymm_v1)
+        ADD_avx2(ymm_v4, ymm_v5)
+        XOR_avx2(ymm_v3, ymm_v0)
+        XOR_avx2(ymm_v7, ymm_v4)
+        ROTW16_avx2(ymm_tmp0, ymm_v3)
+        ROTW16_avx2(ymm_tmp0, ymm_v7)
 
-            # a += b; d ^= a; d = ROTW8(d);
-            ADD_avx2(ymm_v0, ymm_v1)
-            ADD_avx2(ymm_v4, ymm_v5)
-            XOR_avx2(ymm_v3, ymm_v0)
-            XOR_avx2(ymm_v7, ymm_v4)
-            ROTW8_avx2(ymm_tmp0, ymm_v3)
-            ROTW8_avx2(ymm_tmp0, ymm_v7)
+        # c += d; b ^= c; b = ROTW12(b);
+        ADD_avx2(ymm_v2, ymm_v3)
+        ADD_avx2(ymm_v6, ymm_v7)
+        XOR_avx2(ymm_v1, ymm_v2)
+        XOR_avx2(ymm_v5, ymm_v6)
+        ROTW12_avx2(ymm_tmp0, ymm_v1)
+        ROTW12_avx2(ymm_tmp0, ymm_v5)
 
-            # c += d; b ^= c; b = ROTW7(b)
-            ADD_avx2(ymm_v2, ymm_v3)
-            ADD_avx2(ymm_v6, ymm_v7)
-            XOR_avx2(ymm_v1, ymm_v2)
-            XOR_avx2(ymm_v5, ymm_v6)
-            ROTW7_avx2(ymm_tmp0, ymm_v1)
-            ROTW7_avx2(ymm_tmp0, ymm_v5)
+        # a += b; d ^= a; d = ROTW8(d);
+        ADD_avx2(ymm_v0, ymm_v1)
+        ADD_avx2(ymm_v4, ymm_v5)
+        XOR_avx2(ymm_v3, ymm_v0)
+        XOR_avx2(ymm_v7, ymm_v4)
+        ROTW8_avx2(ymm_tmp0, ymm_v3)
+        ROTW8_avx2(ymm_tmp0, ymm_v7)
 
-            # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
-            VPSHUFD(ymm_v1, ymm_v1, 0x93)
-            VPSHUFD(ymm_v5, ymm_v5, 0x93)
-            VPSHUFD(ymm_v2, ymm_v2, 0x4e)
-            VPSHUFD(ymm_v6, ymm_v6, 0x4e)
-            VPSHUFD(ymm_v3, ymm_v3, 0x39)
-            VPSHUFD(ymm_v7, ymm_v7, 0x39)
+        # c += d; b ^= c; b = ROTW7(b)
+        ADD_avx2(ymm_v2, ymm_v3)
+        ADD_avx2(ymm_v6, ymm_v7)
+        XOR_avx2(ymm_v1, ymm_v2)
+        XOR_avx2(ymm_v5, ymm_v6)
+        ROTW7_avx2(ymm_tmp0, ymm_v1)
+        ROTW7_avx2(ymm_tmp0, ymm_v5)
 
-            SUB(reg_rounds, 2)
-            JNZ(rounds_loop4.begin)
+        # b = ROTV1(b); c = ROTV2(c);  d = ROTV3(d);
+        VPSHUFD(ymm_v1, ymm_v1, 0x93)
+        VPSHUFD(ymm_v5, ymm_v5, 0x93)
+        VPSHUFD(ymm_v2, ymm_v2, 0x4e)
+        VPSHUFD(ymm_v6, ymm_v6, 0x4e)
+        VPSHUFD(ymm_v3, ymm_v3, 0x39)
+        VPSHUFD(ymm_v7, ymm_v7, 0x39)
 
-        ADD_avx2(ymm_v0, ymm_s0)
-        ADD_avx2(ymm_v1, ymm_s1)
-        ADD_avx2(ymm_v2, ymm_s2)
-        ADD_avx2(ymm_v3, ymm_s3)
-        WriteXor_avx2(ymm_tmp0, reg_inp, reg_outp, 0, ymm_v0, ymm_v1, ymm_v2, ymm_v3)
-        ADD_avx2(ymm_s3, ymm_inc)
+        SUB(reg_rounds, 2)
+        JNZ(rounds_loop4.begin)
 
-        ADD_avx2(ymm_v4, ymm_s0)
-        ADD_avx2(ymm_v5, ymm_s1)
-        ADD_avx2(ymm_v6, ymm_s2)
-        ADD_avx2(ymm_v7, ymm_s3)
-        WriteXor_avx2(ymm_tmp0, reg_inp, reg_outp, 128, ymm_v4, ymm_v5, ymm_v6, ymm_v7)
-        ADD_avx2(ymm_s3, ymm_inc)
+    ADD_avx2(ymm_v0, ymm_s0)
+    ADD_avx2(ymm_v1, ymm_s1)
+    ADD_avx2(ymm_v2, ymm_s2)
+    ADD_avx2(ymm_v3, ymm_s3)
+    WriteXor_avx2(ymm_tmp0, reg_inp, reg_outp, 0, ymm_v0, ymm_v1, ymm_v2, ymm_v3)
+    ADD_avx2(ymm_s3, ymm_inc)
 
-        ADD(reg_inp, 4 * 64)
-        ADD(reg_outp, 4 * 64)
+    ADD_avx2(ymm_v4, ymm_s0)
+    ADD_avx2(ymm_v5, ymm_s1)
+    ADD_avx2(ymm_v6, ymm_s2)
+    ADD_avx2(ymm_v7, ymm_s3)
+    WriteXor_avx2(ymm_tmp0, reg_inp, reg_outp, 128, ymm_v4, ymm_v5, ymm_v6, ymm_v7)
+    ADD_avx2(ymm_s3, ymm_inc)
 
-        SUB(reg_blocks, 4)
-        JAE(vector_loop4.begin)
+    ADD(reg_inp, 4 * 64)
+    ADD(reg_outp, 4 * 64)
+    SUB(reg_blocks, 4)
 
+    LABEL(process_2_blocks)
     ADD(reg_blocks, 4)
-    JZ(out_write_even)
+    JZ(out_write_even) # 0 blocks left.
 
     #
     # 2/1 blocks at a time.  The two codepaths are unified because
@@ -1150,7 +1140,6 @@ with Function("blocksAmd64AVX2", (x, inp, outp, nrBlocks), target=uarch.broadwel
         VMOVDQA(ymm_v2, ymm_s2)
         VMOVDQA(ymm_v3, ymm_s3)
 
-        reg_rounds = GeneralPurposeRegister64()
         MOV(reg_rounds, 20)
         rounds_loop2 = Loop()
         with rounds_loop2:
@@ -1248,12 +1237,15 @@ with Function("blocksAmd64AVX2", (x, inp, outp, nrBlocks), target=uarch.broadwel
     VPERM2I128(ymm_s3, ymm_s3, ymm_s3, 0x01) # Odd number of blocks.
 
     LABEL(out_write_even)
-    VMOVDQA(x_s3, ymm_s3.as_xmm) # Write back ymm_s3 to x_v3
+    VMOVDQU(x_s3, ymm_s3.as_xmm) # Write back ymm_s3 to x_v3
 
     # Paranoia, cleanse the scratch space.
     VPXOR(ymm_v0, ymm_v0, ymm_v0)
     VMOVDQA(mem_tmp0, ymm_v0)
     VMOVDQA(mem_s3, ymm_v0)
+
+    # Clear all YMM (and XMM) registers.
+    VZEROALL()
 
     # Remove our stack allocation.
     MOV(registers.rsp, reg_sp_save)
@@ -1271,7 +1263,7 @@ with Function("cpuidAmd64", (cpuidParams,)):
     LOAD.ARGUMENT(reg_params, cpuidParams)
 
     MOV(registers.eax, [reg_params])
-    MOV(registers.ecx, [reg_params+4])
+    MOV(registers.ecx, [reg_params+8])
 
     CPUID()
 

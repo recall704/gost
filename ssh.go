@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,10 +39,24 @@ func SSHDirectForwardConnector() Connector {
 }
 
 func (c *sshDirectForwardConnector) Connect(conn net.Conn, raddr string, options ...ConnectOption) (net.Conn, error) {
+	opts := &ConnectOptions{}
+	for _, option := range options {
+		option(opts)
+	}
+
 	cc, ok := conn.(*sshNopConn) // TODO: this is an ugly type assertion, need to find a better solution.
 	if !ok {
 		return nil, errors.New("ssh: wrong connection type")
 	}
+
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = ConnectTimeout
+	}
+
+	cc.session.conn.SetDeadline(time.Now().Add(timeout))
+	defer cc.session.conn.SetDeadline(time.Time{})
+
 	conn, err := cc.session.client.Dial("tcp", raddr)
 	if err != nil {
 		log.Logf("[ssh-tcp] %s -> %s : %s", cc.session.addr, raddr, err)
@@ -81,13 +94,15 @@ func (c *sshRemoteForwardConnector) Connect(conn net.Conn, addr string, options 
 			if err != nil {
 				return
 			}
+			log.Log("[ssh-rtcp] listening on", ln.Addr())
+
 			for {
 				rc, err := ln.Accept()
 				if err != nil {
 					log.Logf("[ssh-rtcp] %s <-> %s accpet : %s", ln.Addr(), addr, err)
 					return
 				}
-
+				// log.Log("[ssh-rtcp] accept", rc.LocalAddr(), rc.RemoteAddr())
 				select {
 				case cc.session.connChan <- rc:
 				default:
@@ -126,10 +141,15 @@ func (tr *sshForwardTransporter) Dial(addr string, options ...DialOption) (conn 
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
 
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DialTimeout
+	}
+
 	session, ok := tr.sessions[addr]
 	if !ok || session.Closed() {
 		if opts.Chain == nil {
-			conn, err = net.DialTimeout("tcp", addr, opts.Timeout)
+			conn, err = net.DialTimeout("tcp", addr, timeout)
 		} else {
 			conn, err = opts.Chain.Dial(addr)
 		}
@@ -152,8 +172,13 @@ func (tr *sshForwardTransporter) Handshake(conn net.Conn, options ...HandshakeOp
 		option(opts)
 	}
 
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = HandshakeTimeout
+	}
+
 	config := ssh.ClientConfig{
-		Timeout:         opts.Timeout,
+		Timeout:         timeout,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 	if opts.User != nil {
@@ -166,6 +191,9 @@ func (tr *sshForwardTransporter) Handshake(conn net.Conn, options ...HandshakeOp
 
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
+
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
 
 	session, ok := tr.sessions[opts.Addr]
 	if !ok || session.client == nil {
@@ -222,10 +250,15 @@ func (tr *sshTunnelTransporter) Dial(addr string, options ...DialOption) (conn n
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
 
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DialTimeout
+	}
+
 	session, ok := tr.sessions[addr]
 	if !ok || session.Closed() {
 		if opts.Chain == nil {
-			conn, err = net.DialTimeout("tcp", addr, opts.Timeout)
+			conn, err = net.DialTimeout("tcp", addr, timeout)
 		} else {
 			conn, err = opts.Chain.Dial(addr)
 		}
@@ -248,10 +281,15 @@ func (tr *sshTunnelTransporter) Handshake(conn net.Conn, options ...HandshakeOpt
 		option(opts)
 	}
 
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = HandshakeTimeout
+	}
+
 	config := ssh.ClientConfig{
-		Timeout:         opts.Timeout,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
+	// TODO: support pubkey auth.
 	if opts.User != nil {
 		config.User = opts.User.Username()
 		password, _ := opts.User.Password()
@@ -262,6 +300,9 @@ func (tr *sshTunnelTransporter) Handshake(conn net.Conn, options ...HandshakeOpt
 
 	tr.sessionMutex.Lock()
 	defer tr.sessionMutex.Unlock()
+
+	conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
 
 	session, ok := tr.sessions[opts.Addr]
 	if !ok || session.client == nil {
@@ -317,7 +358,7 @@ func (s *sshSession) Ping(interval, timeout time.Duration, retries int) {
 		return
 	}
 	if timeout <= 0 {
-		timeout = 10 * time.Second
+		timeout = PingTimeout
 	}
 
 	if retries == 0 {
@@ -424,8 +465,8 @@ func (h *sshForwardHandler) Init(options ...HandlerOption) {
 	}
 	h.config = &ssh.ServerConfig{}
 
-	h.config.PasswordCallback = defaultSSHPasswordCallback(h.options.Users...)
-	if len(h.options.Users) == 0 {
+	h.config.PasswordCallback = defaultSSHPasswordCallback(h.options.Authenticator)
+	if h.options.Authenticator == nil {
 		h.config.NoClientAuth = true
 	}
 	tlsConfig := h.options.TLSConfig
@@ -444,15 +485,15 @@ func (h *sshForwardHandler) Init(options ...HandlerOption) {
 func (h *sshForwardHandler) Handle(conn net.Conn) {
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, h.config)
 	if err != nil {
-		log.Logf("[ssh-forward] %s -> %s : %s", conn.RemoteAddr(), h.options.Addr, err)
+		log.Logf("[ssh-forward] %s -> %s : %s", conn.RemoteAddr(), h.options.Node.Addr, err)
 		conn.Close()
 		return
 	}
 	defer sshConn.Close()
 
-	log.Logf("[ssh-forward] %s <-> %s", conn.RemoteAddr(), h.options.Addr)
+	log.Logf("[ssh-forward] %s <-> %s", conn.RemoteAddr(), h.options.Node.Addr)
 	h.handleForward(sshConn, chans, reqs)
-	log.Logf("[ssh-forward] %s >-< %s", conn.RemoteAddr(), h.options.Addr)
+	log.Logf("[ssh-forward] %s >-< %s", conn.RemoteAddr(), h.options.Node.Addr)
 }
 
 func (h *sshForwardHandler) handleForward(conn ssh.Conn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request) {
@@ -506,7 +547,7 @@ func (h *sshForwardHandler) handleForward(conn ssh.Conn, chans <-chan ssh.NewCha
 func (h *sshForwardHandler) directPortForwardChannel(channel ssh.Channel, raddr string) {
 	defer channel.Close()
 
-	log.Logf("[ssh-tcp] %s - %s", h.options.Addr, raddr)
+	log.Logf("[ssh-tcp] %s - %s", h.options.Node.Addr, raddr)
 
 	if !Can("tcp", raddr, h.options.Whitelist, h.options.Blacklist) {
 		log.Logf("[ssh-tcp] Unauthorized to tcp connect to %s", raddr)
@@ -525,14 +566,14 @@ func (h *sshForwardHandler) directPortForwardChannel(channel ssh.Channel, raddr 
 		ResolverChainOption(h.options.Resolver),
 	)
 	if err != nil {
-		log.Logf("[ssh-tcp] %s - %s : %s", h.options.Addr, raddr, err)
+		log.Logf("[ssh-tcp] %s - %s : %s", h.options.Node.Addr, raddr, err)
 		return
 	}
 	defer conn.Close()
 
-	log.Logf("[ssh-tcp] %s <-> %s", h.options.Addr, raddr)
+	log.Logf("[ssh-tcp] %s <-> %s", h.options.Node.Addr, raddr)
 	transport(conn, channel)
-	log.Logf("[ssh-tcp] %s >-< %s", h.options.Addr, raddr)
+	log.Logf("[ssh-tcp] %s >-< %s", h.options.Node.Addr, raddr)
 }
 
 // tcpipForward is structure for RFC 4254 7.1 "tcpip-forward" request
@@ -553,7 +594,6 @@ func (h *sshForwardHandler) tcpipForwardRequest(sshConn ssh.Conn, req *ssh.Reque
 		return
 	}
 
-	log.Log("[ssh-rtcp] listening on tcp", addr)
 	ln, err := net.Listen("tcp", addr) //tie to the client connection
 	if err != nil {
 		log.Log("[ssh-rtcp]", err)
@@ -561,6 +601,8 @@ func (h *sshForwardHandler) tcpipForwardRequest(sshConn ssh.Conn, req *ssh.Reque
 		return
 	}
 	defer ln.Close()
+
+	log.Log("[ssh-rtcp] listening on tcp", ln.Addr())
 
 	replyFunc := func() error {
 		if t.Port == 0 && req.WantReply { // Client sent port 0. let them know which port is actually being used
@@ -622,8 +664,8 @@ func (h *sshForwardHandler) tcpipForwardRequest(sshConn ssh.Conn, req *ssh.Reque
 
 // SSHConfig holds the SSH tunnel server config
 type SSHConfig struct {
-	Users     []*url.Userinfo
-	TLSConfig *tls.Config
+	Authenticator Authenticator
+	TLSConfig     *tls.Config
 }
 
 type sshTunnelListener struct {
@@ -645,8 +687,8 @@ func SSHTunnelListener(addr string, config *SSHConfig) (Listener, error) {
 	}
 
 	sshConfig := &ssh.ServerConfig{}
-	sshConfig.PasswordCallback = defaultSSHPasswordCallback(config.Users...)
-	if len(config.Users) == 0 {
+	sshConfig.PasswordCallback = defaultSSHPasswordCallback(config.Authenticator)
+	if config.Authenticator == nil {
 		sshConfig.NoClientAuth = true
 	}
 	tlsConfig := config.TLSConfig
@@ -765,14 +807,10 @@ func getHostPortFromAddr(addr net.Addr) (host string, port int, err error) {
 // PasswordCallbackFunc is a callback function used by SSH server.
 type PasswordCallbackFunc func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error)
 
-func defaultSSHPasswordCallback(users ...*url.Userinfo) PasswordCallbackFunc {
+func defaultSSHPasswordCallback(au Authenticator) PasswordCallbackFunc {
 	return func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-		for _, user := range users {
-			u := user.Username()
-			p, _ := user.Password()
-			if u == conn.User() && p == string(password) {
-				return nil, nil
-			}
+		if au.Authenticate(conn.User(), string(password)) {
+			return nil, nil
 		}
 		log.Logf("[ssh] %s -> %s : password rejected for %s", conn.RemoteAddr(), conn.LocalAddr(), conn.User())
 		return nil, fmt.Errorf("password rejected for %s", conn.User())
@@ -810,15 +848,15 @@ func (c *sshNopConn) RemoteAddr() net.Addr {
 }
 
 func (c *sshNopConn) SetDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "http2", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
+	return &net.OpError{Op: "set", Net: "ssh", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
 }
 
 func (c *sshNopConn) SetReadDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "http2", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
+	return &net.OpError{Op: "set", Net: "ssh", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
 }
 
 func (c *sshNopConn) SetWriteDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "http2", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
+	return &net.OpError{Op: "set", Net: "ssh", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
 }
 
 type sshConn struct {
@@ -847,13 +885,13 @@ func (c *sshConn) RemoteAddr() net.Addr {
 }
 
 func (c *sshConn) SetDeadline(t time.Time) error {
-	return nil
+	return c.conn.SetDeadline(t)
 }
 
 func (c *sshConn) SetReadDeadline(t time.Time) error {
-	return nil
+	return c.conn.SetReadDeadline(t)
 }
 
 func (c *sshConn) SetWriteDeadline(t time.Time) error {
-	return nil
+	return c.conn.SetWriteDeadline(t)
 }

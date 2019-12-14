@@ -1,13 +1,18 @@
 package gost
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+)
+
+var (
+	// ErrInvalidNode is an error that implies the node is invalid.
+	ErrInvalidNode = errors.New("invalid node")
 )
 
 // Node is a proxy node, mainly used to construct a proxy chain.
@@ -17,15 +22,15 @@ type Node struct {
 	Host             string
 	Protocol         string
 	Transport        string
-	Remote           string // remote address, used by tcp/udp port forwarding
+	Remote           string   // remote address, used by tcp/udp port forwarding
+	url              *url.URL // raw url
 	User             *url.Userinfo
 	Values           url.Values
 	DialOptions      []DialOption
 	HandshakeOptions []HandshakeOption
+	ConnectOptions   []ConnectOption
 	Client           *Client
-	group            *NodeGroup
-	failCount        uint32
-	failTime         int64
+	marker           *failMarker
 	Bypass           *Bypass
 }
 
@@ -33,8 +38,9 @@ type Node struct {
 // The proxy node string pattern is [scheme://][user:pass@host]:port.
 // Scheme can be divided into two parts by character '+', such as: http+tls.
 func ParseNode(s string) (node Node, err error) {
+	s = strings.TrimSpace(s)
 	if s == "" {
-		return Node{}, nil
+		return Node{}, ErrInvalidNode
 	}
 
 	if !strings.Contains(s, "://") {
@@ -51,7 +57,12 @@ func ParseNode(s string) (node Node, err error) {
 		Remote: strings.Trim(u.EscapedPath(), "/"),
 		Values: u.Query(),
 		User:   u.User,
+		marker: &failMarker{},
+		url:    u,
 	}
+
+	u.RawQuery = ""
+	u.User = nil
 
 	schemes := strings.Split(u.Scheme, "+")
 	if len(schemes) == 1 {
@@ -76,7 +87,7 @@ func ParseNode(s string) (node Node, err error) {
 	}
 
 	switch node.Protocol {
-	case "http", "http2", "socks4", "socks4a", "ss", "ssu", "sni":
+	case "http", "http2", "socks4", "socks4a", "ss", "ss2", "ssu", "sni":
 	case "socks", "socks5":
 		node.Protocol = "socks5"
 	case "tcp", "udp", "rtcp", "rudp": // port forwarding
@@ -89,25 +100,29 @@ func ParseNode(s string) (node Node, err error) {
 	return
 }
 
+// MarkDead marks the node fail status.
+func (node *Node) MarkDead() {
+	if node.marker == nil {
+		return
+	}
+	node.marker.Mark()
+}
+
+// ResetDead resets the node fail status.
+func (node *Node) ResetDead() {
+	if node.marker == nil {
+		return
+	}
+	node.marker.Reset()
+}
+
 // Clone clones the node, it will prevent data race.
 func (node *Node) Clone() Node {
-	return Node{
-		ID:               node.ID,
-		Addr:             node.Addr,
-		Host:             node.Host,
-		Protocol:         node.Protocol,
-		Transport:        node.Transport,
-		Remote:           node.Remote,
-		User:             node.User,
-		Values:           node.Values,
-		DialOptions:      node.DialOptions,
-		HandshakeOptions: node.HandshakeOptions,
-		Client:           node.Client,
-		group:            node.group,
-		failCount:        atomic.LoadUint32(&node.failCount),
-		failTime:         atomic.LoadInt64(&node.failTime),
-		Bypass:           node.Bypass,
+	nd := *node
+	if node.marker != nil {
+		nd.marker = node.marker.Clone()
 	}
+	return nd
 }
 
 // Get returns node parameter specified by key.
@@ -115,20 +130,34 @@ func (node *Node) Get(key string) string {
 	return node.Values.Get(key)
 }
 
-// GetBool likes Get, but convert parameter value to bool.
+// GetBool converts node parameter value to bool.
 func (node *Node) GetBool(key string) bool {
 	b, _ := strconv.ParseBool(node.Values.Get(key))
 	return b
 }
 
-// GetInt likes Get, but convert parameter value to int.
+// GetInt converts node parameter value to int.
 func (node *Node) GetInt(key string) int {
 	n, _ := strconv.Atoi(node.Values.Get(key))
 	return n
 }
 
-func (node *Node) String() string {
-	return fmt.Sprintf("%d@%s", node.ID, node.Addr)
+// GetDuration converts node parameter value to time.Duration.
+func (node *Node) GetDuration(key string) time.Duration {
+	d, _ := time.ParseDuration(node.Values.Get(key))
+	return d
+}
+
+func (node Node) String() string {
+	var scheme string
+	if node.url != nil {
+		scheme = node.url.Scheme
+	}
+	if scheme == "" {
+		scheme = fmt.Sprintf("%s+%s", node.Protocol, node.Transport)
+	}
+	return fmt.Sprintf("%s://%s",
+		scheme, node.Addr)
 }
 
 // NodeGroup is a group of nodes.
@@ -158,16 +187,19 @@ func (group *NodeGroup) AddNode(node ...Node) {
 	group.nodes = append(group.nodes, node...)
 }
 
-// SetNodes replaces the group nodes to the specified nodes.
-func (group *NodeGroup) SetNodes(nodes ...Node) {
+// SetNodes replaces the group nodes to the specified nodes,
+// and returns the previous nodes.
+func (group *NodeGroup) SetNodes(nodes ...Node) []Node {
 	if group == nil {
-		return
+		return nil
 	}
 
 	group.mux.Lock()
 	defer group.mux.Unlock()
 
+	old := group.nodes
 	group.nodes = nodes
+	return old
 }
 
 // SetSelector sets node selector with options for the group.
@@ -194,18 +226,7 @@ func (group *NodeGroup) Nodes() []Node {
 	return group.nodes
 }
 
-func (group *NodeGroup) copyNodes() []Node {
-	group.mux.RLock()
-	defer group.mux.RUnlock()
-
-	var nodes []Node
-	for i := range group.nodes {
-		nodes = append(nodes, group.nodes[i])
-	}
-	return nodes
-}
-
-// GetNode returns a copy of the node specified by index in the group.
+// GetNode returns the node specified by index in the group.
 func (group *NodeGroup) GetNode(i int) Node {
 	group.mux.RLock()
 	defer group.mux.RUnlock()
@@ -213,43 +234,7 @@ func (group *NodeGroup) GetNode(i int) Node {
 	if i < 0 || group == nil || len(group.nodes) <= i {
 		return Node{}
 	}
-	return group.nodes[i].Clone()
-}
-
-// MarkDeadNode marks the node with ID nid status to dead.
-func (group *NodeGroup) MarkDeadNode(nid int) {
-	group.mux.RLock()
-	defer group.mux.RUnlock()
-
-	if group == nil || nid <= 0 {
-		return
-	}
-
-	for i := range group.nodes {
-		if group.nodes[i].ID == nid {
-			atomic.AddUint32(&group.nodes[i].failCount, 1)
-			atomic.StoreInt64(&group.nodes[i].failTime, time.Now().Unix())
-			break
-		}
-	}
-}
-
-// ResetDeadNode resets the node with ID nid status.
-func (group *NodeGroup) ResetDeadNode(nid int) {
-	group.mux.RLock()
-	defer group.mux.RUnlock()
-
-	if group == nil || nid <= 0 {
-		return
-	}
-
-	for i := range group.nodes {
-		if group.nodes[i].ID == nid {
-			atomic.StoreUint32(&group.nodes[i].failCount, 0)
-			atomic.StoreInt64(&group.nodes[i].failTime, 0)
-			break
-		}
-	}
+	return group.nodes[i]
 }
 
 // Next selects a node from group.
@@ -272,7 +257,6 @@ func (group *NodeGroup) Next() (node Node, err error) {
 	if err != nil {
 		return
 	}
-	node.group = group
 
 	return
 }
