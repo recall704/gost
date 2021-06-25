@@ -15,8 +15,9 @@ import (
 
 	"github.com/go-log/log"
 	"github.com/klauspost/compress/snappy"
-	"gopkg.in/xtaci/kcp-go.v4"
-	"gopkg.in/xtaci/smux.v1"
+	"github.com/xtaci/kcp-go"
+	"github.com/xtaci/smux"
+	"github.com/xtaci/tcpraw"
 )
 
 var (
@@ -46,6 +47,7 @@ type KCPConfig struct {
 	SnmpLog      string `json:"snmplog"`
 	SnmpPeriod   int    `json:"snmpperiod"`
 	Signal       bool   `json:"signal"` // Signal enables the signal SIGUSR1 feature.
+	TCP          bool   `json:"tcp"`
 }
 
 // Init initializes the KCP config.
@@ -85,6 +87,7 @@ var (
 		SnmpLog:      "",
 		SnmpPeriod:   60,
 		Signal:       false,
+		TCP:          false,
 	}
 )
 
@@ -129,13 +132,24 @@ func (tr *kcpTransporter) Dial(addr string, options ...DialOption) (conn net.Con
 		ok = false
 	}
 	if !ok {
-		timeout := opts.Timeout
-		if timeout <= 0 {
-			timeout = DialTimeout
-		}
-		conn, err = net.DialTimeout("udp", addr, timeout)
+		raddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
-			return
+			return nil, err
+		}
+		if tr.config.TCP {
+			pc, err := tcpraw.Dial("tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			conn = &fakeTCPConn{
+				raddr:      raddr,
+				PacketConn: pc,
+			}
+		} else {
+			conn, err = net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
 		}
 		session = &muxSession{conn: conn}
 		tr.sessions[addr] = session
@@ -184,14 +198,14 @@ func (tr *kcpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (
 }
 
 func (tr *kcpTransporter) initSession(addr string, conn net.Conn, config *KCPConfig) (*muxSession, error) {
-	udpConn, ok := conn.(*net.UDPConn)
+	pc, ok := conn.(net.PacketConn)
 	if !ok {
 		return nil, errors.New("kcp: wrong connection type")
 	}
 
 	kcpconn, err := kcp.NewConn(addr,
 		blockCrypt(config.Key, config.Crypt, KCPSalt),
-		config.DataShard, config.ParityShard, &connectedUDPConn{udpConn})
+		config.DataShard, config.ParityShard, pc)
 	if err != nil {
 		return nil, err
 	}
@@ -203,9 +217,11 @@ func (tr *kcpTransporter) initSession(addr string, conn net.Conn, config *KCPCon
 	kcpconn.SetMtu(config.MTU)
 	kcpconn.SetACKNoDelay(config.AckNodelay)
 
-	// if err := kcpconn.SetDSCP(config.DSCP); err != nil {
-	// 	log.Log("[kcp]", err)
-	// }
+	if config.DSCP > 0 {
+		if err := kcpconn.SetDSCP(config.DSCP); err != nil {
+			log.Log("[kcp]", err)
+		}
+	}
 	if err := kcpconn.SetReadBuffer(config.SockBuf); err != nil {
 		log.Log("[kcp]", err)
 	}
@@ -247,14 +263,31 @@ func KCPListener(addr string, config *KCPConfig) (Listener, error) {
 	}
 	config.Init()
 
-	ln, err := kcp.ListenWithOptions(addr,
-		blockCrypt(config.Key, config.Crypt, KCPSalt), config.DataShard, config.ParityShard)
+	var err error
+	var ln *kcp.Listener
+	if config.TCP {
+		var conn net.PacketConn
+		conn, err = tcpraw.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		ln, err = kcp.ServeConn(
+			blockCrypt(config.Key, config.Crypt, KCPSalt), config.DataShard, config.ParityShard, conn)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		ln, err = kcp.ListenWithOptions(addr,
+			blockCrypt(config.Key, config.Crypt, KCPSalt), config.DataShard, config.ParityShard)
+	}
 	if err != nil {
 		return nil, err
 	}
-	// if err = ln.SetDSCP(config.DSCP); err != nil {
-	// 	log.Log("[kcp]", err)
-	// }
+	if config.DSCP > 0 {
+		if err = ln.SetDSCP(config.DSCP); err != nil {
+			log.Log("[kcp]", err)
+		}
+	}
 	if err = ln.SetReadBuffer(config.SockBuf); err != nil {
 		log.Log("[kcp]", err)
 	}

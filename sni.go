@@ -5,6 +5,7 @@ package gost
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/asaskevich/govalidator"
 	dissector "github.com/ginuerzh/tls-dissector"
 	"github.com/go-log/log"
 )
@@ -29,8 +31,17 @@ func SNIConnector(host string) Connector {
 	return &sniConnector{host: host}
 }
 
-func (c *sniConnector) Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error) {
-	return &sniClientConn{addr: addr, host: c.host, Conn: conn}, nil
+func (c *sniConnector) Connect(conn net.Conn, address string, options ...ConnectOption) (net.Conn, error) {
+	return c.ConnectContext(context.Background(), conn, "tcp", address, options...)
+}
+
+func (c *sniConnector) ConnectContext(ctx context.Context, conn net.Conn, network, address string, options ...ConnectOption) (net.Conn, error) {
+	switch network {
+	case "udp", "udp4", "udp6":
+		return nil, fmt.Errorf("%s unsupported", network)
+	}
+
+	return &sniClientConn{addr: address, host: c.host, Conn: conn}, nil
 }
 
 type sniHandler struct {
@@ -75,9 +86,11 @@ func (h *sniHandler) Handle(conn net.Conn) {
 				conn.RemoteAddr(), conn.LocalAddr(), err)
 			return
 		}
-		if !req.URL.IsAbs() {
-			req.URL.Scheme = "http" // make sure that the URL is absolute
+
+		if !req.URL.IsAbs() && govalidator.IsDNSName(req.Host) {
+			req.URL.Scheme = "http"
 		}
+
 		handler := &httpHandler{options: h.options}
 		handler.Init()
 		handler.handleRequest(conn, req)
@@ -262,7 +275,7 @@ func readClientHelloRecord(r io.Reader, host string, isClient bool) ([]byte, str
 	if err != nil {
 		return nil, "", err
 	}
-	clientHello := &dissector.ClientHelloHandshake{}
+	clientHello := &dissector.ClientHelloMsg{}
 	if err := clientHello.Decode(record.Opaque); err != nil {
 		return nil, "", err
 	}
@@ -272,7 +285,8 @@ func readClientHelloRecord(r io.Reader, host string, isClient bool) ([]byte, str
 
 		for _, ext := range clientHello.Extensions {
 			if ext.Type() == 0xFFFE {
-				if host, err = decodeServerName(string(ext.Bytes()[4:])); err == nil {
+				b, _ := ext.Encode()
+				if host, err = decodeServerName(string(b)); err == nil {
 					continue
 				}
 			}
@@ -288,8 +302,8 @@ func readClientHelloRecord(r io.Reader, host string, isClient bool) ([]byte, str
 				host = snExtension.Name
 			}
 			if isClient {
-				clientHello.Extensions = append(clientHello.Extensions,
-					dissector.NewExtension(0xFFFE, []byte(encodeServerName(snExtension.Name))))
+				e, _ := dissector.NewExtension(0xFFFE, []byte(encodeServerName(snExtension.Name)))
+				clientHello.Extensions = append(clientHello.Extensions, e)
 			}
 			if host != "" {
 				snExtension.Name = host

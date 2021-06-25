@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/ioutil"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -43,8 +44,9 @@ var (
 	defaultKeyFile  = "key.pem"
 )
 
-// Load the certificate from cert and key files, will use the default certificate if the provided info are invalid.
-func tlsConfig(certFile, keyFile string) (*tls.Config, error) {
+// Load the certificate from cert & key files and optional client CA file,
+// will use the default certificate if the provided info are invalid.
+func tlsConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if certFile == "" || keyFile == "" {
 		certFile, keyFile = defaultCertFile, defaultKeyFile
 	}
@@ -53,7 +55,15 @@ func tlsConfig(certFile, keyFile string) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	if pool, _ := loadCA(caFile); pool != nil {
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return cfg, nil
 }
 
 func loadCA(caFile string) (cp *x509.CertPool, err error) {
@@ -218,13 +228,19 @@ func parseResolver(cfg string) gost.Resolver {
 				continue
 			}
 			if strings.HasPrefix(s, "https") {
+				p := "https"
+				u, _ := url.Parse(s)
+				if u == nil || u.Scheme == "" {
+					continue
+				}
+				if u.Scheme == "https-chain" {
+					p = u.Scheme
+				}
 				ns := gost.NameServer{
 					Addr:     s,
-					Protocol: "https",
+					Protocol: p,
 				}
-				if err := ns.Init(); err == nil {
-					nss = append(nss, ns)
-				}
+				nss = append(nss, ns)
 				continue
 			}
 
@@ -233,18 +249,14 @@ func parseResolver(cfg string) gost.Resolver {
 				ns := gost.NameServer{
 					Addr: ss[0],
 				}
-				if err := ns.Init(); err == nil {
-					nss = append(nss, ns)
-				}
+				nss = append(nss, ns)
 			}
 			if len(ss) == 2 {
 				ns := gost.NameServer{
 					Addr:     ss[0],
 					Protocol: ss[1],
 				}
-				if err := ns.Init(); err == nil {
-					nss = append(nss, ns)
-				}
+				nss = append(nss, ns)
 			}
 		}
 		return gost.NewResolver(0, nss...)
@@ -272,4 +284,50 @@ func parseHosts(s string) *gost.Hosts {
 	go gost.PeriodReload(hosts, s)
 
 	return hosts
+}
+
+func parseIPRoutes(s string) (routes []gost.IPRoute) {
+	if s == "" {
+		return
+	}
+
+	file, err := os.Open(s)
+	if err != nil {
+		ss := strings.Split(s, ",")
+		for _, s := range ss {
+			if _, inet, _ := net.ParseCIDR(strings.TrimSpace(s)); inet != nil {
+				routes = append(routes, gost.IPRoute{Dest: inet})
+			}
+		}
+		return
+	}
+
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.Replace(scanner.Text(), "\t", " ", -1)
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		var route gost.IPRoute
+		var ss []string
+		for _, s := range strings.Split(line, " ") {
+			if s = strings.TrimSpace(s); s != "" {
+				ss = append(ss, s)
+			}
+		}
+		if len(ss) > 0 && ss[0] != "" {
+			_, route.Dest, _ = net.ParseCIDR(strings.TrimSpace(ss[0]))
+			if route.Dest == nil {
+				continue
+			}
+		}
+		if len(ss) > 1 && ss[1] != "" {
+			route.Gateway = net.ParseIP(ss[1])
+		}
+		routes = append(routes, route)
+	}
+	return routes
 }

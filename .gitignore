@@ -8,6 +8,7 @@ _obj
 _test
 release
 debian
+bin
 
 # Architecture specific extensions/prefixes
 *.[568vq]
@@ -20,6 +21,9 @@ _cgo_gotypes.go
 _cgo_export.*
 
 _testmain.go
+
+*.swp
+*.swo
 
 *.exe
 *.test

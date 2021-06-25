@@ -18,6 +18,8 @@ import (
 var (
 	configureFile string
 	baseCfg       = &baseConfig{}
+	pprofAddr     string
+	pprofEnabled  = os.Getenv("PROFILING") != ""
 )
 
 func init() {
@@ -28,14 +30,17 @@ func init() {
 	)
 
 	flag.Var(&baseCfg.route.ChainNodes, "F", "forward address, can make a forward chain")
-	flag.Var(&baseCfg.route.ServeNodes, "L", "listen address, can listen on multiple ports")
+	flag.Var(&baseCfg.route.ServeNodes, "L", "listen address, can listen on multiple ports (required)")
 	flag.StringVar(&configureFile, "C", "", "configure file")
 	flag.BoolVar(&baseCfg.Debug, "D", false, "enable debug log")
 	flag.BoolVar(&printVersion, "V", false, "print version")
+	if pprofEnabled {
+		flag.StringVar(&pprofAddr, "P", ":6060", "profiling HTTP server address")
+	}
 	flag.Parse()
 
 	if printVersion {
-		fmt.Fprintf(os.Stderr, "gost %s (%s %s/%s)\n",
+		fmt.Fprintf(os.Stdout, "gost %s (%s %s/%s)\n",
 			gost.Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		os.Exit(0)
 	}
@@ -54,14 +59,15 @@ func init() {
 }
 
 func main() {
-	if os.Getenv("PROFILING") != "" {
+	if pprofEnabled {
 		go func() {
-			log.Log(http.ListenAndServe("127.0.0.1:16060", nil))
+			log.Log("profiling server on", pprofAddr)
+			log.Log(http.ListenAndServe(pprofAddr, nil))
 		}()
 	}
 
 	// NOTE: as of 2.6, you can use custom cert/key files to initialize the default certificate.
-	tlsConfig, err := tlsConfig(defaultCertFile, defaultKeyFile)
+	tlsConfig, err := tlsConfig(defaultCertFile, defaultKeyFile, "")
 	if err != nil {
 		// generate random self-signed certificate.
 		cert, err := gost.GenCertificate()
@@ -72,6 +78,8 @@ func main() {
 		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		}
+	} else {
+		log.Log("load TLS certificate files OK")
 	}
 	gost.DefaultTLSConfig = tlsConfig
 

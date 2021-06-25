@@ -1,13 +1,17 @@
-// +build !windows
+// +build linux
 
 package gost
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"syscall"
+	"time"
 
+	"github.com/LiamHaworth/go-tproxy"
 	"github.com/go-log/log"
 )
 
@@ -15,7 +19,7 @@ type tcpRedirectHandler struct {
 	options *HandlerOptions
 }
 
-// TCPRedirectHandler creates a server Handler for TCP redirect server.
+// TCPRedirectHandler creates a server Handler for TCP transparent server.
 func TCPRedirectHandler(opts ...HandlerOption) Handler {
 	h := &tcpRedirectHandler{}
 	h.Init(opts...)
@@ -49,7 +53,8 @@ func (h *tcpRedirectHandler) Handle(c net.Conn) {
 
 	log.Logf("[red-tcp] %s -> %s", srcAddr, dstAddr)
 
-	cc, err := h.options.Chain.Dial(dstAddr.String(),
+	cc, err := h.options.Chain.DialContext(context.Background(),
+		"tcp", dstAddr.String(),
 		RetryChainOption(h.options.Retries),
 		TimeoutChainOption(h.options.Timeout),
 	)
@@ -96,4 +101,141 @@ func (h *tcpRedirectHandler) getOriginalDstAddr(conn *net.TCPConn) (addr net.Add
 		err = errors.New("not a TCP connection")
 	}
 	return
+}
+
+type udpRedirectHandler struct {
+	options *HandlerOptions
+}
+
+// UDPRedirectHandler creates a server Handler for UDP transparent server.
+func UDPRedirectHandler(opts ...HandlerOption) Handler {
+	h := &udpRedirectHandler{}
+	h.Init(opts...)
+
+	return h
+}
+
+func (h *udpRedirectHandler) Init(options ...HandlerOption) {
+	if h.options == nil {
+		h.options = &HandlerOptions{}
+	}
+
+	for _, opt := range options {
+		opt(h.options)
+	}
+}
+
+func (h *udpRedirectHandler) Handle(conn net.Conn) {
+	defer conn.Close()
+
+	raddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		log.Log("[red-udp] wrong connection type")
+		return
+	}
+
+	cc, err := h.options.Chain.DialContext(context.Background(),
+		"udp", raddr.String(),
+		RetryChainOption(h.options.Retries),
+		TimeoutChainOption(h.options.Timeout),
+	)
+	if err != nil {
+		log.Logf("[red-udp] %s - %s : %s", conn.RemoteAddr(), raddr, err)
+		return
+	}
+	defer cc.Close()
+
+	log.Logf("[red-udp] %s <-> %s", conn.RemoteAddr(), raddr)
+	transport(conn, cc)
+	log.Logf("[red-udp] %s >-< %s", conn.RemoteAddr(), raddr)
+}
+
+type udpRedirectListener struct {
+	*net.UDPConn
+	config *UDPListenConfig
+}
+
+// UDPRedirectListener creates a Listener for UDP transparent proxy server.
+func UDPRedirectListener(addr string, cfg *UDPListenConfig) (Listener, error) {
+	laddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	ln, err := tproxy.ListenUDP("udp", laddr)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg == nil {
+		cfg = &UDPListenConfig{}
+	}
+	return &udpRedirectListener{
+		UDPConn: ln,
+		config:  cfg,
+	}, nil
+}
+
+func (l *udpRedirectListener) Accept() (conn net.Conn, err error) {
+	b := make([]byte, mediumBufferSize)
+
+	n, raddr, dstAddr, err := tproxy.ReadFromUDP(l.UDPConn, b)
+	if err != nil {
+		log.Logf("[red-udp] %s : %s", l.Addr(), err)
+		return
+	}
+	log.Logf("[red-udp] %s: %s -> %s", l.Addr(), raddr, dstAddr)
+
+	c, err := tproxy.DialUDP("udp", dstAddr, raddr)
+	if err != nil {
+		log.Logf("[red-udp] %s -> %s : %s", raddr, dstAddr, err)
+		return
+	}
+
+	ttl := l.config.TTL
+	if ttl <= 0 {
+		ttl = defaultTTL
+	}
+
+	conn = &udpRedirectServerConn{
+		Conn: c,
+		buf:  b[:n],
+		ttl:  ttl,
+	}
+	return
+}
+
+func (l *udpRedirectListener) Addr() net.Addr {
+	return l.UDPConn.LocalAddr()
+}
+
+type udpRedirectServerConn struct {
+	net.Conn
+	buf  []byte
+	ttl  time.Duration
+	once sync.Once
+}
+
+func (c *udpRedirectServerConn) Read(b []byte) (n int, err error) {
+	if c.ttl > 0 {
+		c.SetReadDeadline(time.Now().Add(c.ttl))
+		defer c.SetReadDeadline(time.Time{})
+	}
+	c.once.Do(func() {
+		n = copy(b, c.buf)
+		c.buf = nil
+	})
+
+	if n == 0 {
+		n, err = c.Conn.Read(b)
+	}
+	return
+}
+
+func (c *udpRedirectServerConn) Write(b []byte) (n int, err error) {
+	if c.ttl > 0 {
+		c.SetWriteDeadline(time.Now().Add(c.ttl))
+		defer c.SetWriteDeadline(time.Time{})
+	}
+	return c.Conn.Write(b)
 }
