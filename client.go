@@ -1,6 +1,7 @@
 package gost
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/url"
@@ -14,23 +15,8 @@ import (
 // Connector is responsible for connecting to the destination address through this proxy.
 // Transporter performs a handshake with this proxy.
 type Client struct {
-	Connector   Connector
-	Transporter Transporter
-}
-
-// Dial connects to the target address.
-func (c *Client) Dial(addr string, options ...DialOption) (net.Conn, error) {
-	return c.Transporter.Dial(addr, options...)
-}
-
-// Handshake performs a handshake with the proxy over connection conn.
-func (c *Client) Handshake(conn net.Conn, options ...HandshakeOption) (net.Conn, error) {
-	return c.Transporter.Handshake(conn, options...)
-}
-
-// Connect connects to the address addr via the proxy over connection conn.
-func (c *Client) Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error) {
-	return c.Connector.Connect(conn, addr, options...)
+	Connector
+	Transporter
 }
 
 // DefaultClient is a standard HTTP proxy client.
@@ -53,7 +39,36 @@ func Connect(conn net.Conn, addr string) (net.Conn, error) {
 
 // Connector is responsible for connecting to the destination address.
 type Connector interface {
-	Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error)
+	// Deprecated: use ConnectContext instead.
+	Connect(conn net.Conn, address string, options ...ConnectOption) (net.Conn, error)
+	ConnectContext(ctx context.Context, conn net.Conn, network, address string, options ...ConnectOption) (net.Conn, error)
+}
+
+type autoConnector struct {
+	User *url.Userinfo
+}
+
+// AutoConnector is a Connector.
+func AutoConnector(user *url.Userinfo) Connector {
+	return &autoConnector{
+		User: user,
+	}
+}
+
+func (c *autoConnector) Connect(conn net.Conn, address string, options ...ConnectOption) (net.Conn, error) {
+	return c.ConnectContext(context.Background(), conn, "tcp", address, options...)
+}
+
+func (c *autoConnector) ConnectContext(ctx context.Context, conn net.Conn, network, address string, options ...ConnectOption) (net.Conn, error) {
+	var cnr Connector
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		cnr = &httpConnector{User: c.User}
+	default:
+		cnr = &socks5UDPTunConnector{User: c.User}
+	}
+
+	return cnr.ConnectContext(ctx, conn, network, address, options...)
 }
 
 // Transporter is responsible for handshaking with the proxy server.
@@ -62,38 +77,6 @@ type Transporter interface {
 	Handshake(conn net.Conn, options ...HandshakeOption) (net.Conn, error)
 	// Indicate that the Transporter supports multiplex
 	Multiplex() bool
-}
-
-// tcpTransporter is a raw TCP transporter.
-type tcpTransporter struct{}
-
-// TCPTransporter creates a raw TCP client.
-func TCPTransporter() Transporter {
-	return &tcpTransporter{}
-}
-
-func (tr *tcpTransporter) Dial(addr string, options ...DialOption) (net.Conn, error) {
-	opts := &DialOptions{}
-	for _, option := range options {
-		option(opts)
-	}
-
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = DialTimeout
-	}
-	if opts.Chain == nil {
-		return net.DialTimeout("tcp", addr, timeout)
-	}
-	return opts.Chain.Dial(addr)
-}
-
-func (tr *tcpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (net.Conn, error) {
-	return conn, nil
-}
-
-func (tr *tcpTransporter) Multiplex() bool {
-	return false
 }
 
 // udpTransporter is a raw UDP transporter.
@@ -130,6 +113,7 @@ func (tr *udpTransporter) Multiplex() bool {
 type DialOptions struct {
 	Timeout time.Duration
 	Chain   *Chain
+	Host    string
 }
 
 // DialOption allows a common way to set DialOptions.
@@ -149,6 +133,13 @@ func ChainDialOption(chain *Chain) DialOption {
 	}
 }
 
+// HostDialOption specifies the host used by Transporter.Dial
+func HostDialOption(host string) DialOption {
+	return func(opts *DialOptions) {
+		opts.Host = host
+	}
+}
+
 // HandshakeOptions describes the options for handshake.
 type HandshakeOptions struct {
 	Addr       string
@@ -161,6 +152,7 @@ type HandshakeOptions struct {
 	WSOptions  *WSOptions
 	KCPConfig  *KCPConfig
 	QUICConfig *QUICConfig
+	SSHConfig  *SSHConfig
 }
 
 // HandshakeOption allows a common way to set HandshakeOptions.
@@ -236,6 +228,13 @@ func QUICConfigHandshakeOption(config *QUICConfig) HandshakeOption {
 	}
 }
 
+// SSHConfigHandshakeOption specifies the ssh config used by SSH client handshake.
+func SSHConfigHandshakeOption(config *SSHConfig) HandshakeOption {
+	return func(opts *HandshakeOptions) {
+		opts.SSHConfig = config
+	}
+}
+
 // ConnectOptions describes the options for Connector.Connect.
 type ConnectOptions struct {
 	Addr      string
@@ -243,6 +242,8 @@ type ConnectOptions struct {
 	User      *url.Userinfo
 	Selector  gosocks5.Selector
 	UserAgent string
+	NoTLS     bool
+	NoDelay   bool
 }
 
 // ConnectOption allows a common way to set ConnectOptions.
@@ -280,5 +281,19 @@ func SelectorConnectOption(s gosocks5.Selector) ConnectOption {
 func UserAgentConnectOption(ua string) ConnectOption {
 	return func(opts *ConnectOptions) {
 		opts.UserAgent = ua
+	}
+}
+
+// NoTLSConnectOption specifies the SOCKS5 method without TLS.
+func NoTLSConnectOption(b bool) ConnectOption {
+	return func(opts *ConnectOptions) {
+		opts.NoTLS = b
+	}
+}
+
+// NoDelayConnectOption specifies the NoDelay option for ss.Connect.
+func NoDelayConnectOption(b bool) ConnectOption {
+	return func(opts *ConnectOptions) {
+		opts.NoDelay = b
 	}
 }

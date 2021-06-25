@@ -75,24 +75,43 @@ func ParseNode(s string) (node Node, err error) {
 	}
 
 	switch node.Transport {
-	case "tls", "mtls", "ws", "mws", "wss", "mwss", "kcp", "ssh", "quic", "ssu", "http2", "h2", "h2c", "obfs4":
 	case "https":
-		node.Protocol = "http"
 		node.Transport = "tls"
-	case "tcp", "udp": // started from v2.1, tcp and udp are for local port forwarding
+	case "tls", "mtls":
+	case "http2", "h2", "h2c":
+	case "ws", "mws", "wss", "mwss":
+	case "kcp", "ssh", "quic":
+	case "ssu":
+		node.Transport = "udp"
+	case "ohttp", "otls", "obfs4": // obfs
+	case "tcp", "udp":
 	case "rtcp", "rudp": // rtcp and rudp are for remote port forwarding
-	case "ohttp": // obfs-http
+	case "tun", "tap": // tun/tap device
+	case "ftcp": // fake TCP
+	case "dns":
+	case "redu", "redirectu": // UDP tproxy
 	default:
 		node.Transport = "tcp"
 	}
 
 	switch node.Protocol {
-	case "http", "http2", "socks4", "socks4a", "ss", "ss2", "ssu", "sni":
+	case "http", "http2":
+	case "https":
+		node.Protocol = "http"
+	case "socks4", "socks4a":
 	case "socks", "socks5":
 		node.Protocol = "socks5"
+	case "ss", "ssu":
+	case "ss2": // as of 2.10.1, ss2 is same as ss
+		node.Protocol = "ss"
+	case "sni":
 	case "tcp", "udp", "rtcp", "rudp": // port forwarding
 	case "direct", "remote", "forward": // forwarding
-	case "redirect": // TCP transparent proxy
+	case "red", "redirect", "redu", "redirectu": // TCP,UDP transparent proxy
+	case "tun", "tap": // tun/tap device
+	case "ftcp": // fake TCP
+	case "dns", "dot", "doh":
+	case "relay":
 	default:
 		node.Protocol = ""
 	}
@@ -138,13 +157,16 @@ func (node *Node) GetBool(key string) bool {
 
 // GetInt converts node parameter value to int.
 func (node *Node) GetInt(key string) int {
-	n, _ := strconv.Atoi(node.Values.Get(key))
+	n, _ := strconv.Atoi(node.Get(key))
 	return n
 }
 
 // GetDuration converts node parameter value to time.Duration.
 func (node *Node) GetDuration(key string) time.Duration {
-	d, _ := time.ParseDuration(node.Values.Get(key))
+	d, err := time.ParseDuration(node.Get(key))
+	if err != nil {
+		d = time.Duration(node.GetInt(key)) * time.Second
+	}
 	return d
 }
 

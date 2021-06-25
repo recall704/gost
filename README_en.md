@@ -20,20 +20,21 @@ Features
 * [Support multiple tunnel types](https://docs.ginuerzh.xyz/gost/en/configuration/)
 * [TLS encryption via negotiation support for SOCKS5 proxy](https://docs.ginuerzh.xyz/gost/en/socks/)
 * [Tunnel UDP over TCP](https://docs.ginuerzh.xyz/gost/en/socks/)
-* [Transparent TCP proxy](https://docs.ginuerzh.xyz/gost/en/redirect/)
+* [TCP/UDP Transparent proxy](https://docs.ginuerzh.xyz/gost/en/redirect/)
 * [Local/remote TCP/UDP port forwarding](https://docs.ginuerzh.xyz/gost/en/port-forwarding/)
 * [Shadowsocks protocol](https://docs.ginuerzh.xyz/gost/en/ss/)
 * [SNI proxy](https://docs.ginuerzh.xyz/gost/en/sni/)
 * [Permission control](https://docs.ginuerzh.xyz/gost/en/permission/)
 * [Load balancing](https://docs.ginuerzh.xyz/gost/en/load-balancing/)
 * [Routing control](https://docs.ginuerzh.xyz/gost/en/bypass/)
-* [DNS control](https://docs.ginuerzh.xyz/gost/en/dns/)
+* DNS [resolver](https://docs.ginuerzh.xyz/gost/resolver/) and [proxy](https://docs.ginuerzh.xyz/gost/dns/)
+* [TUN/TAP device](https://docs.ginuerzh.xyz/gost/en/tuntap/)
 
 Wiki: <https://docs.ginuerzh.xyz/gost/en/>
 
-Google group: <https://groups.google.com/d/forum/go-gost>
-
 Telegram group: <https://t.me/gogost>
+
+Google group: <https://groups.google.com/d/forum/go-gost>
 
 Installation
 ------
@@ -45,7 +46,9 @@ Installation
 #### From source
 
 ```bash
-go get -u github.com/ginuerzh/gost/cmd/gost
+git clone https://github.com/ginuerzh/gost.git
+cd gost/cmd/gost
+go build
 ```
 
 #### Docker
@@ -54,9 +57,16 @@ go get -u github.com/ginuerzh/gost/cmd/gost
 docker pull ginuerzh/gost
 ```
 
+#### Homebrew
+
+```bash
+brew install gost
+```
+
 #### Ubuntu store
 
 ```bash
+sudo snap install core
 sudo snap install gost
 ```
 

@@ -23,20 +23,21 @@ gost - GO Simple Tunnel
 * [支持多种隧道类型](https://docs.ginuerzh.xyz/gost/configuration/)
 * [SOCKS5代理支持TLS协商加密](https://docs.ginuerzh.xyz/gost/socks/)
 * [Tunnel UDP over TCP](https://docs.ginuerzh.xyz/gost/socks/)
-* [TCP透明代理](https://docs.ginuerzh.xyz/gost/redirect/)
+* [TCP/UDP透明代理](https://docs.ginuerzh.xyz/gost/redirect/)
 * [本地/远程TCP/UDP端口转发](https://docs.ginuerzh.xyz/gost/port-forwarding/)
 * [支持Shadowsocks(TCP/UDP)协议](https://docs.ginuerzh.xyz/gost/ss/)
 * [支持SNI代理](https://docs.ginuerzh.xyz/gost/sni/)
 * [权限控制](https://docs.ginuerzh.xyz/gost/permission/)
 * [负载均衡](https://docs.ginuerzh.xyz/gost/load-balancing/)
 * [路由控制](https://docs.ginuerzh.xyz/gost/bypass/)
-* [DNS控制](https://docs.ginuerzh.xyz/gost/dns/)
+* DNS[解析](https://docs.ginuerzh.xyz/gost/resolver/)和[代理](https://docs.ginuerzh.xyz/gost/dns/)
+* [TUN/TAP设备](https://docs.ginuerzh.xyz/gost/tuntap/)
 
 Wiki站点: <https://docs.ginuerzh.xyz/gost/>
 
-Google讨论组: <https://groups.google.com/d/forum/go-gost>
-
 Telegram讨论群: <https://t.me/gogost>
+
+Google讨论组: <https://groups.google.com/d/forum/go-gost>
 
 安装
 ------
@@ -48,7 +49,9 @@ Telegram讨论群: <https://t.me/gogost>
 #### 源码编译
 
 ```bash
-go get -u github.com/ginuerzh/gost/cmd/gost
+git clone https://github.com/ginuerzh/gost.git
+cd gost/cmd/gost
+go build
 ```
 
 #### Docker
@@ -57,9 +60,16 @@ go get -u github.com/ginuerzh/gost/cmd/gost
 docker pull ginuerzh/gost
 ```
 
+#### Homebrew
+
+```bash
+brew install gost
+```
+
 #### Ubuntu商店
 
 ```bash
+sudo snap install core
 sudo snap install gost
 ```
 

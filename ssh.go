@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"strconv"
 	"strings"
@@ -30,6 +31,34 @@ var (
 	errSessionDead = errors.New("session is dead")
 )
 
+// ParseSSHKeyFile parses ssh key file.
+func ParseSSHKeyFile(fp string) (ssh.Signer, error) {
+	key, err := ioutil.ReadFile(fp)
+	if err != nil {
+		return nil, err
+	}
+	return ssh.ParsePrivateKey(key)
+}
+
+// ParseSSHAuthorizedKeysFile parses ssh Authorized Keys file.
+func ParseSSHAuthorizedKeysFile(fp string) (map[string]bool, error) {
+	authorizedKeysBytes, err := ioutil.ReadFile(fp)
+	if err != nil {
+		return nil, err
+	}
+	authorizedKeysMap := make(map[string]bool)
+	for len(authorizedKeysBytes) > 0 {
+		pubKey, _, _, rest, err := ssh.ParseAuthorizedKey(authorizedKeysBytes)
+		if err != nil {
+			return nil, err
+		}
+		authorizedKeysMap[string(pubKey.Marshal())] = true
+		authorizedKeysBytes = rest
+	}
+
+	return authorizedKeysMap, nil
+}
+
 type sshDirectForwardConnector struct {
 }
 
@@ -39,6 +68,15 @@ func SSHDirectForwardConnector() Connector {
 }
 
 func (c *sshDirectForwardConnector) Connect(conn net.Conn, raddr string, options ...ConnectOption) (net.Conn, error) {
+	return c.ConnectContext(context.Background(), conn, "tcp", raddr, options...)
+}
+
+func (c *sshDirectForwardConnector) ConnectContext(ctx context.Context, conn net.Conn, network, raddr string, options ...ConnectOption) (net.Conn, error) {
+	switch network {
+	case "udp", "udp4", "udp6":
+		return nil, fmt.Errorf("%s unsupported", network)
+	}
+
 	opts := &ConnectOptions{}
 	for _, option := range options {
 		option(opts)
@@ -73,7 +111,16 @@ func SSHRemoteForwardConnector() Connector {
 	return &sshRemoteForwardConnector{}
 }
 
-func (c *sshRemoteForwardConnector) Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error) {
+func (c *sshRemoteForwardConnector) Connect(conn net.Conn, address string, options ...ConnectOption) (net.Conn, error) {
+	return c.ConnectContext(context.Background(), conn, "tcp", address, options...)
+}
+
+func (c *sshRemoteForwardConnector) ConnectContext(ctx context.Context, conn net.Conn, network, address string, options ...ConnectOption) (net.Conn, error) {
+	switch network {
+	case "udp", "udp4", "udp6":
+		return nil, fmt.Errorf("%s unsupported", network)
+	}
+
 	cc, ok := conn.(*sshNopConn) // TODO: this is an ugly type assertion, need to find a better solution.
 	if !ok {
 		return nil, errors.New("ssh: wrong connection type")
@@ -87,10 +134,10 @@ func (c *sshRemoteForwardConnector) Connect(conn net.Conn, addr string, options 
 			if cc.session == nil || cc.session.client == nil {
 				return
 			}
-			if strings.HasPrefix(addr, ":") {
-				addr = "0.0.0.0" + addr
+			if strings.HasPrefix(address, ":") {
+				address = "0.0.0.0" + address
 			}
-			ln, err := cc.session.client.Listen("tcp", addr)
+			ln, err := cc.session.client.Listen("tcp", address)
 			if err != nil {
 				return
 			}
@@ -99,7 +146,7 @@ func (c *sshRemoteForwardConnector) Connect(conn net.Conn, addr string, options 
 			for {
 				rc, err := ln.Accept()
 				if err != nil {
-					log.Logf("[ssh-rtcp] %s <-> %s accpet : %s", ln.Addr(), addr, err)
+					log.Logf("[ssh-rtcp] %s <-> %s accpet : %s", ln.Addr(), address, err)
 					return
 				}
 				// log.Log("[ssh-rtcp] accept", rc.LocalAddr(), rc.RemoteAddr())
@@ -107,7 +154,7 @@ func (c *sshRemoteForwardConnector) Connect(conn net.Conn, addr string, options 
 				case cc.session.connChan <- rc:
 				default:
 					rc.Close()
-					log.Logf("[ssh-rtcp] %s - %s: connection queue is full", ln.Addr(), addr)
+					log.Logf("[ssh-rtcp] %s - %s: connection queue is full", ln.Addr(), address)
 				}
 			}
 		}()
@@ -183,10 +230,14 @@ func (tr *sshForwardTransporter) Handshake(conn net.Conn, options ...HandshakeOp
 	}
 	if opts.User != nil {
 		config.User = opts.User.Username()
-		password, _ := opts.User.Password()
-		config.Auth = []ssh.AuthMethod{
-			ssh.Password(password),
+		if password, _ := opts.User.Password(); password != "" {
+			config.Auth = []ssh.AuthMethod{
+				ssh.Password(password),
+			}
 		}
+	}
+	if opts.SSHConfig != nil && opts.SSHConfig.Key != nil {
+		config.Auth = append(config.Auth, ssh.PublicKeys(opts.SSHConfig.Key))
 	}
 
 	tr.sessionMutex.Lock()
@@ -199,6 +250,7 @@ func (tr *sshForwardTransporter) Handshake(conn net.Conn, options ...HandshakeOp
 	if !ok || session.client == nil {
 		sshConn, chans, reqs, err := ssh.NewClientConn(conn, opts.Addr, &config)
 		if err != nil {
+			log.Log("ssh", err)
 			conn.Close()
 			delete(tr.sessions, opts.Addr)
 			return nil, err
@@ -287,15 +339,20 @@ func (tr *sshTunnelTransporter) Handshake(conn net.Conn, options ...HandshakeOpt
 	}
 
 	config := ssh.ClientConfig{
+		Timeout:         timeout,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 	// TODO: support pubkey auth.
 	if opts.User != nil {
 		config.User = opts.User.Username()
-		password, _ := opts.User.Password()
-		config.Auth = []ssh.AuthMethod{
-			ssh.Password(password),
+		if password, _ := opts.User.Password(); password != "" {
+			config.Auth = []ssh.AuthMethod{
+				ssh.Password(password),
+			}
 		}
+	}
+	if opts.SSHConfig != nil && opts.SSHConfig.Key != nil {
+		config.Auth = append(config.Auth, ssh.PublicKeys(opts.SSHConfig.Key))
 	}
 
 	tr.sessionMutex.Lock()
@@ -664,8 +721,10 @@ func (h *sshForwardHandler) tcpipForwardRequest(sshConn ssh.Conn, req *ssh.Reque
 
 // SSHConfig holds the SSH tunnel server config
 type SSHConfig struct {
-	Authenticator Authenticator
-	TLSConfig     *tls.Config
+	Authenticator  Authenticator
+	TLSConfig      *tls.Config
+	Key            ssh.Signer
+	AuthorizedKeys map[string]bool
 }
 
 type sshTunnelListener struct {
@@ -686,21 +745,22 @@ func SSHTunnelListener(addr string, config *SSHConfig) (Listener, error) {
 		config = &SSHConfig{}
 	}
 
-	sshConfig := &ssh.ServerConfig{}
-	sshConfig.PasswordCallback = defaultSSHPasswordCallback(config.Authenticator)
-	if config.Authenticator == nil {
+	sshConfig := &ssh.ServerConfig{
+		PasswordCallback:  defaultSSHPasswordCallback(config.Authenticator),
+		PublicKeyCallback: defaultSSHPublicKeyCallback(config.AuthorizedKeys),
+	}
+
+	if config.Authenticator == nil && len(config.AuthorizedKeys) == 0 {
 		sshConfig.NoClientAuth = true
 	}
-	tlsConfig := config.TLSConfig
-	if tlsConfig == nil {
-		tlsConfig = DefaultTLSConfig
-	}
 
-	signer, err := ssh.NewSignerFromKey(tlsConfig.Certificates[0].PrivateKey)
-	if err != nil {
-		ln.Close()
-		return nil, err
-
+	signer := config.Key
+	if signer == nil {
+		signer, err = ssh.NewSignerFromKey(DefaultTLSConfig.Certificates[0].PrivateKey)
+		if err != nil {
+			ln.Close()
+			return nil, err
+		}
 	}
 	sshConfig.AddHostKey(signer)
 
@@ -805,15 +865,41 @@ func getHostPortFromAddr(addr net.Addr) (host string, port int, err error) {
 }
 
 // PasswordCallbackFunc is a callback function used by SSH server.
+// It authenticates user using a password.
 type PasswordCallbackFunc func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error)
 
 func defaultSSHPasswordCallback(au Authenticator) PasswordCallbackFunc {
+	if au == nil {
+		return nil
+	}
 	return func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 		if au.Authenticate(conn.User(), string(password)) {
 			return nil, nil
 		}
 		log.Logf("[ssh] %s -> %s : password rejected for %s", conn.RemoteAddr(), conn.LocalAddr(), conn.User())
 		return nil, fmt.Errorf("password rejected for %s", conn.User())
+	}
+}
+
+// PublicKeyCallbackFunc is a callback function used by SSH server.
+// It offers a public key for authentication.
+type PublicKeyCallbackFunc func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error)
+
+func defaultSSHPublicKeyCallback(keys map[string]bool) PublicKeyCallbackFunc {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	return func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+		if keys[string(pubKey.Marshal())] {
+			return &ssh.Permissions{
+				// Record the public key used for authentication.
+				Extensions: map[string]string{
+					"pubkey-fp": ssh.FingerprintSHA256(pubKey),
+				},
+			}, nil
+		}
+		return nil, fmt.Errorf("unknown public key for %q", c.User())
 	}
 }
 
