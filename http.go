@@ -150,6 +150,10 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 	}
 
 	host := req.Host
+	if req.URL.Host == "" {
+		req.URL.Host = host
+		req.URL.Scheme = "http"
+	}
 	if _, port, _ := net.SplitHostPort(host); port == "" {
 		host = net.JoinHostPort(host, "80")
 	}
